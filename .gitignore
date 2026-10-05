@@ -1,0 +1,24 @@
+# Detector weights: fetched at setup time, not committed (README documents the URL).
+*.pt
+
+# Ultralytics demo asset, not a project input.
+bus.jpg
+
+# Datasets and anything derived from them.
+data/
+
+# Benchmark output and logs are regenerable via scripts/run_full_benchmark.sh.
+results/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

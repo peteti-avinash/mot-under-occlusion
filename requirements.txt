@@ -1,0 +1,37 @@
+# Direct dependencies for the MOT occlusion tracker.
+#
+# Pinned to the exact versions this project was developed and benchmarked
+# against: Python 3.12, CUDA 13.0, one NVIDIA RTX 5060 Laptop GPU (8 GiB).
+#
+# torch/torchvision carry a "+cu130" local version because they were installed
+# from the PyTorch CUDA 13.0 wheel index, not from PyPI. A plain `torch==2.14.1`
+# from PyPI would silently resolve to a different (non-CUDA-matched) build, so
+# the extra index below is load-bearing, not a convenience.
+
+# PyPI stays the primary index; the PyTorch index is additive and searched for
+# the "+cu130" local-version builds. Declaring PyPI first also keeps the
+# resolver from treating the PyTorch index as authoritative for unrelated
+# packages (it ships its own numpy, which would trip dependency confusion).
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+numpy==2.5.3
+scipy==1.18.1
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+ultralytics==8.4.173
+
+# Supplies MOTA / MOTP / IDF1 and the event counts (IDS, fragmentations, MT, ML).
+# One helper in it, motmetrics.distances.iou_matrix, is unusable here: it calls
+# np.asfarray, which NumPy 2.0 removed. src/mot/metrics.py therefore computes the
+# CLEAR-MOT distance matrix locally (see distance_matrix) and only hands the
+# result to MOTAccumulator, so no behaviour depends on the broken function.
+motmetrics==1.4.0
+
+# cv2.__version__ reports "5.0.0"; the full PyPI version is 5.0.0.93.
+opencv-python==5.0.0.93
+
+# Installed transitively by ultralytics/motmetrics, listed because the benchmark
+# environment was built with them and they affect nothing behaviourally here:
+#   Pillow==12.3.0  tqdm==4.70.1  matplotlib==3.11.2  PyYAML==6.0.3
+#   psutil==7.2.2   pandas==3.0.6
