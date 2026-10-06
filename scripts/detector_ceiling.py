@@ -5,13 +5,19 @@ constraint, then differences between trackers are mostly differences in how
 they cope with missed detections, and the write-up should say so.
 
     PYTHONPATH=src ./venv/bin/python scripts/detector_ceiling.py \
-        --sequence 02 --frames 60
+        --sequence 02 --frames 60 --out results/detector_ceiling_02.json
 
 Greedy one-to-one matching at IoU >= 0.5 against MOT17 ground truth, using the
 same class filtering and ignore-region suppression as the evaluator, so the
 numbers here are comparable with the pipeline's evaluation.
+
+Scope warning: ``--frames`` evaluates only the first N frames, so these
+numbers describe that slice and not the sequence. Compare detector recall on
+frame set X only against tracker recall measured on the same frame set X; a
+subset detector ceiling says nothing about a full-benchmark tracker score.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -139,10 +145,16 @@ def main():
     ap.add_argument("--configs", default="default",
                     help="'default', 'size-sweep', 'conf-sweep', or comma-separated "
                          "weights:imgsz:conf triples")
+    ap.add_argument("--out", default=None,
+                    help="write the measurements to this JSON path so the "
+                         "write-up can cite a file rather than a terminal")
     args = ap.parse_args()
 
     root = find_dataset_root(args.dataset_root)
     sequences = {s.name: s for s in list_sequences(root, detector="FRCNN")}
+    # Accept the MOTChallenge directory suffix as well as the bare number, since
+    # both spellings are natural for a CLI argument.
+    sequences.update({name.split("-")[1]: s for name, s in list(sequences.items())})
     if args.sequence not in sequences:
         raise SystemExit(f"sequence {args.sequence} not found under {root}; "
                          f"have {sorted(sequences)}")
@@ -169,6 +181,7 @@ def main():
             weights, imgsz, conf = item.split(":")
             configs.append((weights, int(imgsz), float(conf)))
 
+    rows = []
     for weights, imgsz, conf in configs:
         if not os.path.exists(weights):
             print(f"  {weights:14s} SKIPPED (missing weights; see README)")
@@ -182,6 +195,32 @@ def main():
         print(f"{weights:14s} {imgsz:6d} {conf:6.2f} "
               f"{recall * 100:7.2f}% {precision * 100:7.2f}% "
               f"{tp:6d} {n_det:6d} {n_gt:6d}", flush=True)
+        rows.append({
+            "weights": weights,
+            "imgsz": imgsz,
+            "conf": conf,
+            "recall": recall * 100.0,
+            "precision": precision * 100.0,
+            "tp": tp,
+            "num_detections": n_det,
+            "num_gt": n_gt,
+        })
+
+    if args.out:
+        payload = {
+            "sequence": seq.name,
+            "frames_evaluated": total,
+            "frame_ids": [int(f) for f in frames],
+            "iou_threshold": IOU_THRESHOLD,
+            "matching": "greedy highest-IoU-first one-to-one",
+            "num_gt_total": rows[0]["num_gt"] if rows else 0,
+            "measurements": rows,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        print(f"\nwrote {args.out}")
     return 0
 
 

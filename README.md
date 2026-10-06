@@ -28,7 +28,7 @@ the negative results. Headline numbers are reproduced there.
 | `src/mot/occlusion.py` | Occlusion tracker: cascade association + re-ID |
 | `src/mot/metrics.py` | MOT metrics + HOTA (self-contained; see *Metrics* below) |
 | `src/mot/pipeline.py` | CLI that ties detector + tracker + evaluator together |
-| `tests/` | 51 tests across five suites, no pytest required |
+| `tests/` | 60 tests across five suites, no pytest required |
 | `scripts/run_full_benchmark.sh` | Runs both trackers over all seven sequences |
 | `scripts/detector_ceiling.py` | Measures detection ceiling (no tracker) for the write-up |
 | `scripts/reevaluate.py` | Recomputes metrics from written `.txt` files, no GPU |
@@ -95,9 +95,14 @@ Useful flags (defaults in brackets):
 Output is MOT-format `results/<tag>/MOT17-XX-FRCNN.txt` plus a `metrics.json` summary.
 
 `metrics.json` is authoritative. Its `aggregate` row pools the MOTChallenge rates
-from summed event counts; recomputing from the `.txt` files instead
-(`scripts/reevaluate.py`) shifts a few borderline IoU matches, because results
-are written at `%.2f` precision.
+from summed event counts, weights MOTP by matches, and recomputes IDF1 from
+pooled ID counts; only HOTA and its components are unweighted means over
+sequences (see *Metrics* below). Recomputing
+from the `.txt` files instead (`scripts/reevaluate.py`) reproduces those numbers
+to within 0.002 HOTA / 0.015 MOTA per sequence — the residual is `%.2f`
+quantisation of box coordinates shifting borderline IoU matches, not a
+disagreement. It still cannot see detections that `min_hits` suppressed before
+they were written, so it is a debugging tool rather than a substitute.
 
 ## Tests
 
@@ -105,7 +110,7 @@ are written at `%.2f` precision.
 PYTHONPATH=src ./venv/bin/python tests/run_all.py
 ```
 
-51 tests, five suites (`tracker`, `detector`, `metrics`, `metrics aggregate`,
+60 tests, five suites (`tracker`, `detector`, `metrics`, `metrics aggregate`,
 `detector_ceiling`). The suite runner is hand-rolled (`tests/_runner.py`) because
 pytest is not available in this environment.
 
@@ -135,17 +140,48 @@ counts, with two deliberate deviations:
   `1 - distance`. Without the conversion the column would be mislabelled.
 - **Ignore regions are handled explicitly.** `motmetrics` has no notion of MOT17's
   annotated distractor / ignored boxes, so detections inside them are filtered
-  before scoring.
+  before scoring. The regions are applied to *hypotheses only*: a ground-truth box
+  whose centre falls inside an ignore region still counts as a missed target. That
+  is the convention implemented here, and it is the only thing the phrase "ignore
+  regions" leaves open, so it is worth quantifying. Dropping such ground-truth
+  boxes as well was measured over the seven SORT sequences: HOTA moves by **+0.91 on
+  average**, ranging from −0.14 (MOT17-09) to +2.16 (MOT17-04), and MOTA by **−0.83
+  on average**, reaching −6.36 on MOT17-09. A +2.16 HOTA shift is ~10% of this
+  project's 21.5 baseline, so neither metric should be compared across the two
+  conventions without a note.
 
 HOTA is implemented from the paper in the same module so its definition is auditable
-in one place. The association term carries an `H` penalty for identity switches —
-dropping it is a silent bug that makes HOTA degenerate into a detection score which
-returns 1.0 even when every frame has a different track id. `tests/test_metrics.py`
-pins this.
+in one place. Association is a sequence-wide Jaccard over global
+`(gt id, tracker id)` pairs, so dropping the association term is a silent bug that
+makes HOTA degenerate into a detection score and return 1.0 even when every frame
+has a different track id. `tests/test_metrics.py` pins this.
 
-This is the paper's single-class form; TrackEval aggregates the association term
-differently (a log-Jaccard over global id pairs), so absolute HOTA differs from
-published TrackEval numbers while preserving ranking order.
+This is the TrackEval *formulation*, but the per-sequence values here are **not**
+directly comparable to published MOTChallenge HOTA numbers. This project evaluates
+MOT17 classes 1/2/4/7 as targets; the official protocol scores class 1 only and
+suppresses hypotheses matched to distractor classes. Measured on identical
+hypothesis files, restricting ground truth to class 1 alone shifts per-sequence
+HOTA by +0.08 to +2.38 (mean +0.91 over the seven sequences). Compare against
+other work only after normalising the class convention. The per-frame Hungarian assignment is
+driven by the global alignment score rather than raw IoU, which is what stops
+identity flipping between nearby people.
+
+Two deliberate differences from the TrackEval tool are worth stating plainly. The
+MOTChallenge rates in the `OVERALL` row — MOTA, precision, recall, MOTP, IDF1 — are
+pooled the way TrackEval's `COMBINED_SEQ` pools them, but **HOTA is not**: TrackEval
+pools per-alpha TP counts and association sums across sequences and recomputes the
+score, whereas `OVERALL` takes the unweighted mean of the per-sequence HOTA values.
+Both are legitimate, but they are different quantities, so the HOTA `OVERALL` must not
+be quoted as TrackEval's `COMBINED_SEQ` HOTA. On this dataset the distinction is not
+cosmetic: pooled MOTA is 34.87 against a sequence mean of 32.07, because pooling
+weights MOT17-02's 26,960 evaluated objects against much longer sequences
+differently than averaging seven scores does.
+
+And TrackEval's per-frame assignment uses buffered
+`+=` indexing, which keeps only the last write for a duplicated index; this
+implementation uses `np.add.at`, which sums every row. The two agree exactly on
+valid MOT data, where an id appears at most once per frame, and differ only on
+input that is not valid MOT data.
 
 ## Notes and limitations
 
@@ -160,4 +196,14 @@ published TrackEval numbers while preserving ranking order.
 
 ## License
 
-See repository metadata. MOT17 is distributed by its own authors under its own terms.
+MIT — see [LICENSE](LICENSE), which also carries the TrackEval notice for the
+transcribed HOTA metric in `src/mot/metrics.py`.
+
+The HOTA metric in `src/mot/metrics.py` was transcribed from TrackEval
+(https://github.com/JonathonLuiten/TrackEval, © Jonathon Luiten). TrackEval is
+MIT-licensed and carries its own copyright notice; the attribution above was
+written from the upstream project without re-fetching its license text, since
+this environment has no outbound network access — verify against upstream before
+redistribution if that matters for your compliance process.
+
+MOT17 is distributed by its own authors under its own terms.

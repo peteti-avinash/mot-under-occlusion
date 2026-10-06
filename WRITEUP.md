@@ -17,6 +17,15 @@ Dataset: the seven MOT17 **FRCNN** train sequences (02, 04, 05, 09, 10, 11, 13),
 **5,316 frames**. Classes 1/2/4/7 are evaluated; annotated ignore regions are
 suppressed. Metrics are 0–100 for MOTA/MOTP/HOTA and 0–1 for IDF1.
 
+**Result.** Holding the detector fixed, adding occlusion-aware association moves
+**HOTA 21.51 → 32.01 (+10.51)** and **IDF1 0.267 → 0.379**, with **−27% identity
+switches** (−813 over 5,316 frames). It costs **−3.69 precision** (88.48 → 84.79)
+and **−1.34 MOTP**, most plausibly because surviving tracks emit boxes for
+pedestrians that are not annotated. The trade is "remember more, be wrong more
+often" — the right direction for re-identification and the wrong one for
+counting. Scope: one detector configuration, one run per tracker, no
+hyperparameter sweep, no per-component ablation.
+
 ---
 
 ## 1. The bugs that actually mattered
@@ -39,18 +48,21 @@ A tracker that assigns a brand-new identity to every pedestrian in every frame s
 collapsed into DetA. Any tuning done against that number would have been tuning against
 pure detection recall.
 
-Fixed by charging an `H` penalty for a ground-truth box being matched to a different
-track id than it was matched to previously. Same inputs, now:
+Fixed by scoring association as a sequence-wide Jaccard over `(gt id, tracker id)`
+pairs (`metrics.py:147-291`), which is the TrackEval formulation. Same inputs, now:
 
 | hypothesis boxes | HOTA | DetA | AssA |
 | --- | --- | --- | --- |
 | perfect, identity kept | 1.000 | 1.000 | 1.000 |
-| perfect, 1 switch in 10 frames | 0.975 | 1.000 | 0.950 |
-| perfect, **new id every frame** | **0.742** | 1.000 | 0.550 |
-| 2 GT ids, only 1 detected | 0.354 | 0.500 | 0.500 |
+| perfect, 1 switch in 10 frames | 0.707 | 1.000 | 0.500 |
+| perfect, **new id every frame** | **0.316** | 1.000 | 0.100 |
+| 2 GT ids, only 1 detected | 0.707 | 0.500 | 1.000 |
 
-`tests/test_metrics.py` pins all five rows with hand-computed values, and the
-identity-switch test is verified to fail if the `H` term is removed.
+Note the last two rows: HOTA is `sqrt(DetA * AssA)`, so perfect association with
+half the boxes detected still scores 0.707, while re-issuing every identity scores
+0.316. The original implementation could not distinguish those cases at all.
+`tests/test_metrics.py` pins each of these four rows by hand derivation, including
+the per-pair Jaccard arithmetic.
 
 **This bug invalidated every earlier benchmark number in this project.** They are
 recomputed in §3 from the corrected implementation.
@@ -74,7 +86,8 @@ red if the `update()` increment is restored:
 ### 1.3 A covariance crash that only appears in the field
 
 Sequences occasionally drive a track's covariance indefinite after many missed frames.
-The original float32 Cholesky raised `LinAlgError` at `kalman.py:178`.
+The original float32 Cholesky raised `LinAlgError` inside the Cholesky helper in
+`src/mot/kalman.py`.
 
 Isolated by capture: the failing 8x8 covariance already had minimum eigenvalue ≈
 **−6.53e4**, and the projected covariance ≈ **−3.26e4** — not a rounding wobble but a
@@ -105,7 +118,10 @@ for the preventive changes.
 - `num_matches` was missing from the aggregate's sum list, so `metrics.json` reported
   `"num_matches": 0.0` for the OVERALL row while every per-sequence value was non-zero.
 - Recomputing metrics from the written `.txt` files differs from the in-run numbers by
-  1–5 matches per sequence. This is **not** a bug: `write_results` emits coordinates at
+  0–5 matches per sequence (four of the seven SORT sequences agree exactly on
+  `num_matches`; none agree on every scalar to the last digit, because MOTP is itself a
+  ratio over those same coordinates). This is
+  **not** a bug: `write_results` emits coordinates at
   `%.2f`, which perturbs IoU enough to flip matches sitting within ~1e-4 of the 0.5
   threshold. `metrics.json` from the pipeline run is therefore the authoritative source,
   and `scripts/reevaluate.py` is for regenerating metrics after a *metrics-code* change.
@@ -116,8 +132,11 @@ for the preventive changes.
 
 Tracker comparisons are only meaningful once you know how much of the gap is upstream.
 `scripts/detector_ceiling.py` measures the ceiling: greedy one-to-one matching at
-IoU ≥ 0.5 against ground truth, with the same class filtering and ignore-region
-suppression as the evaluator, and **no tracker at all**.
+IoU ≥ 0.5 against ground truth, with the same class filtering as the evaluator and
+the same ≥50%-containment ignore-region rule (the evaluator keeps
+`inside_fraction <= 0.5` in `metrics.py:138`, the ceiling script suppresses
+`>= 0.5` in `detector_ceiling.py:93`; they differ only at exactly 50%, which the
+tests pin deliberately), and **no tracker at all**.
 
 | weights | imgsz | conf | recall | precision | TP | det | GT |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -130,10 +149,12 @@ suppression as the evaluator, and **no tracker at all**.
 | yolo11x | 1600 | 0.35 | 35.88% | 85.24% | 797 | 935 | 2221 |
 | yolo11x | 1600 | 0.40 | 33.41% | 88.76% | 742 | 836 | 2221 |
 
-(MOT17-02, first 60 frames, 2,221 ground-truth boxes.)
+(MOT17-02, first 60 frames, 2,221 ground-truth boxes. These numbers describe
+that slice only — compare detector recall on this slice against tracker recall
+on the same slice; a full-sequence tracker score is not directly comparable.)
 
 The matching logic behind this table is unit-tested (`tests/test_detector_ceiling.py`,
-12 tests, hand-computed IoU boundaries and one-to-one enforcement) because the entire
+14 tests, hand-computed IoU boundaries and one-to-one enforcement) because the entire
 "detection is the bottleneck" claim rests on it.
 
 Conclusion: recall is roughly **half** of what a perfect tracker would need. Every
@@ -149,27 +170,25 @@ Detector fixed at `yolo11x` / `imgsz=1600` / `conf=0.25` for both trackers.
 
 ### Per sequence (SORT / occlusion)
 
-| sequence | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MOT17-02 | 25.03 / 27.86 | 80.93 / 79.94 | 16.13 / 17.71 | 0.191 / 0.264 | 522 / 434 | 633 / 593 | 3.0 / 7.0 | 34.0 / 31.0 | 27.76 / 31.94 | 92.52 / 89.79 | 7340 / 8473 |
-| MOT17-04 | 42.10 / 43.79 | 84.21 / 83.69 | 26.83 / 27.78 | 0.349 / 0.419 | 844 / 528 | 1075 / 879 | 24.0 / 27.0 | 30.0 / 31.0 | 48.12 / 50.61 | 89.83 / 88.69 | 30343 / 32073 |
-| MOT17-05 | 7.50 / 15.20 | 75.41 / 74.59 | 15.73 / 22.30 | 0.159 / 0.308 | 260 / 248 | 318 / 261 | 0.0 / 16.0 | 85.0 / 38.0 | 21.24 / 40.40 | 61.19 / 62.07 | 1548 / 2949 |
-| MOT17-09 | 49.97 / 57.13 | 81.79 / 80.61 | 31.11 / 34.24 | 0.222 / 0.433 | 263 / 156 | 269 / 157 | 1.0 / 8.0 | 2.0 / 1.0 | 56.64 / 66.32 | 92.94 / 89.70 | 3158 / 3769 |
-| MOT17-10 | 32.66 / 45.54 | 77.28 / 75.32 | 21.95 / 28.11 | 0.154 / 0.397 | 587 / 343 | 692 / 765 | 3.0 / 13.0 | 22.0 / 8.0 | 38.52 / 58.17 | 89.65 / 83.50 | 5249 / 8069 |
-| MOT17-11 | 43.02 / 38.77 | 84.29 / 83.77 | 29.97 / 30.33 | 0.217 / 0.369 | 274 / 170 | 302 / 171 | 9.0 / 22.0 | 32.0 / 31.0 | 57.60 / 63.72 | 81.24 / 72.43 | 5325 / 5957 |
-| MOT17-13 | 24.22 / 44.97 | 78.21 / 77.61 | 16.56 / 26.26 | 0.214 / 0.398 | 267 / 325 | 346 / 489 | 3.0 / 27.0 | 67.0 / 22.0 | 26.59 / 54.68 | 93.65 / 86.64 | 3052 / 6245 |
+| sequence | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec | Matches |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| MOT17-02 | 25.03 / 27.86 | 80.93 / 79.94 | 16.62 / 22.20 | 0.191 / 0.264 | 522 / 434 | 633 / 593 | 3.0 / 7.0 | 34.0 / 31.0 | 27.76 / 31.94 | 92.52 / 89.79 | 7340 / 8473 |
+| MOT17-04 | 42.10 / 43.79 | 84.21 / 83.69 | 34.57 / 39.58 | 0.349 / 0.419 | 844 / 528 | 1075 / 879 | 24.0 / 27.0 | 30.0 / 31.0 | 48.12 / 50.61 | 89.83 / 88.69 | 30343 / 32073 |
+| MOT17-05 | 7.50 / 15.20 | 75.41 / 74.59 | 15.93 / 26.97 | 0.159 / 0.308 | 260 / 248 | 318 / 261 | 0.0 / 16.0 | 85.0 / 38.0 | 21.24 / 40.40 | 61.19 / 62.07 | 1548 / 2949 |
+| MOT17-09 | 49.97 / 57.13 | 81.79 / 80.61 | 22.85 / 34.23 | 0.222 / 0.433 | 263 / 156 | 269 / 157 | 1.0 / 8.0 | 2.0 / 1.0 | 56.64 / 66.32 | 92.94 / 89.70 | 3158 / 3769 |
+| MOT17-10 | 32.66 / 45.54 | 77.28 / 75.32 | 16.26 / 31.57 | 0.154 / 0.397 | 587 / 343 | 692 / 765 | 3.0 / 13.0 | 22.0 / 8.0 | 38.52 / 58.17 | 89.65 / 83.50 | 5249 / 8069 |
+| MOT17-11 | 43.02 / 38.77 | 84.29 / 83.77 | 26.51 / 36.30 | 0.217 / 0.369 | 274 / 170 | 302 / 171 | 9.0 / 22.0 | 32.0 / 31.0 | 57.60 / 63.72 | 81.24 / 72.43 | 5325 / 5957 |
+| MOT17-13 | 24.22 / 44.97 | 78.21 / 77.61 | 17.79 / 33.26 | 0.214 / 0.398 | 267 / 325 | 346 / 489 | 3.0 / 27.0 | 67.0 / 22.0 | 26.59 / 54.68 | 93.65 / 86.64 | 3052 / 6245 |
 
-Cells are `SORT / occlusion`.
+Cells are `SORT / occlusion`. Regenerate with `scripts/make_report.py`.
 
 **Overall**
-
-### Overall
 
 | metric | SORT | occlusion | Δ (occ − SORT) |
 | --- | --- | --- | --- |
 | mota | 34.87 | 39.66 | +4.80 (better) |
 | motp | 82.43 | 81.09 | -1.34 (worse) |
-| hota | 22.61 | 26.67 | +4.06 (better) |
+| hota | 21.51 | 32.01 | +10.51 (better) |
 | idf1 | 0.267 | 0.379 | +0.11 (better) |
 | num_switches | 3017 | 2204 | -813.00 (better) |
 | num_fragmentations | 3635 | 3315 | -320.00 (better) |
@@ -179,12 +198,16 @@ Cells are `SORT / occlusion`.
 | precision | 88.48 | 84.79 | -3.69 (worse) |
 | num_matches | 56015 | 67535 | +11520.00 (better) |
 
+`OVERALL` pools the MOTChallenge rates (MOTA, precision, recall), weights MOTP by
+matches, and recomputes IDF1 from pooled ID counts; only HOTA and its components are
+unweighted sequence means, and count metrics are summed — see §5.
+
 **Overall: the occlusion tracker wins on every identity metric and loses on precision.**
 
 | metric | SORT | occlusion | delta | |
 | --- | --- | --- | --- | --- |
 | MOTA | 34.87 | **39.66** | **+4.80** | better |
-| HOTA | 22.61 | **26.67** | **+4.06** | better |
+| HOTA | 21.51 | **32.01** | **+10.51** | better |
 | IDF1 | 0.267 | **0.379** | **+0.112** | better |
 | MOTP | **82.43** | 81.09 | −1.34 | worse |
 | recall | 40.97 | **49.11** | **+8.13** | better |
@@ -196,16 +219,21 @@ Cells are `SORT / occlusion`.
 
 The identity metrics are the point of the experiment and they all move the right
 way: **−27% identity switches**, mostly-tracked nearly triples, and mostly-lost
-drops by more than a third. Keeping a track alive across an occlusion is exactly
-what raises recall (+8.1) and what lowers switches.
+drops by more than a third. HOTA separates them most sharply (**21.5 → 32.0,
++10.5**), consistent with HOTA scoring association quality rather than detection
+quality alone. The recall gain (+8.1) and the switch reduction come together,
+but attributing the gain to track retention specifically is an inference, not a
+measurement: this is one composite variant against one baseline, at one
+detector configuration, with no per-component ablation.
 
-The cost is precision (−3.7), and it is a direct consequence rather than a
-surprise: a track that survives an occlusion without being re-acquired keeps
-emitting boxes where no pedestrian is annotated, which scores as false positive
-and as localization error (MOTP −1.3). The tracker is trading "confidently wrong
-less often" for "remember more often". For a surveillance or re-identification
-workload that is the correct direction; for a count-vehicles-on-a-roadline
-workload it would not be.
+The cost is precision (−3.7). A track that survives an occlusion without being
+re-acquired keeps emitting boxes where no pedestrian is annotated, which scores
+as false positive and as localization error (MOTP −1.3); that is the most
+plausible mechanism, and it is consistent with the per-sequence precision
+pattern below, but it was not isolated by experiment. The tracker trades
+"confidently wrong less often" for "remember more often". For a surveillance or
+re-identification workload that is the correct direction; for a
+count-vehicles-on-a-roadline workload it would not be.
 
 Sequence 11 is the honest counter-example: it is the one sequence where the
 occlusion tracker **loses** MOTA (43.02 → 38.77) even though it improves identity
@@ -217,10 +245,14 @@ Sequence 13 shows the same effect at the other extreme: MOTA nearly doubles
 (24.22 → 44.97) and recall more than doubles (26.59 → 54.68), but precision still
 falls.
 
-Taken with §2, the headline is a ceiling: even the better tracker reaches 49%
-recall against a 40% detector recall ceiling, and the detector is the reason the
-absolute numbers are low. Identity recovery is worth roughly +4.8 MOTA / +0.11
-IDF1 here; a trained person-ReID embedding is plausibly worth more.
+Taken with §2, the headline is a ceiling: the detector alone misses more than
+half the boxes on MOT17-02's first 60 frames (40.34% recall), and the
+full-sequence recall numbers in §3 are low for the same reason — though §2
+measures a 60-frame slice and §3 measures full sequences, so the two are not
+directly comparable. The measured gap between the two trackers is +4.8 MOTA /
++0.11 IDF1; the hand-rolled appearance term accounts for part of it at unknown
+share. A trained person-ReID embedding is plausibly worth more, but nothing
+here measures that.
 
 ---
 
@@ -233,24 +265,33 @@ Recording these because they cost time and constrain the design:
   it is not trained to tell two similar individuals apart. Download attempts for a
   trained person-ReID checkpoint returned `401`/`404`. The appearance cue helps, but the
   headroom a real ReID encoder would unlock is the largest single improvement available.
-- **Raising the detector confidence does not fix recall.** `conf=0.30` trades recall for
-  precision and lowers both the detector ceiling and end-to-end MOTA (§2). The
-  `det_conf_threshold=0.3` is used *only* to start new tracks; lower-confidence
-  detections still sustain existing ones.
+- **Raising the detector confidence does not fix recall.** The §2 sweep shows
+  `conf=0.30` trades recall for precision at the detector level (38.27% vs
+  40.34% recall on the same slice). Whether that trade lowers end-to-end MOTA
+  was not measured — the pipeline keeps `det_conf_threshold=0.3` for track
+  starts; lower-confidence detections still sustain existing ones.
 - **Longer `max_age` is not free.** Retaining coasting tracks longer preserves identity
   but converts missed detections into stale false positives; MOTA degrades before HOTA
   does.
 - **`motmetrics` cannot be used for HOTA**, and one of its helpers
   (`distances.iou_matrix`, via the removed `np.asfarray`) cannot be used at all on
   NumPy 2 — see README.
-- **`scripts/reevaluate.py` cannot reproduce `metrics.json` exactly.** Result files
-  are written at `%.2f` precision, which flips matches whose IoU sits within ~1e-4 of
-  the 0.5 threshold. It is a debugging and re-scoring tool, not a substitute for the
-  in-run metrics.
-- **The occlusion tracker is CPU-bound, not GPU-bound** (~800% CPU, 24% GPU). The
-  cost is per-track numpy association work, not detection; the appearance encoder is
-  already on the GPU. It runs at ~2 fps against SORT's ~14 fps, so a seven-sequence
-  benchmark takes ~45 min instead of ~6.
+- **`scripts/reevaluate.py` reproduces `metrics.json` to rounding, not bit-exactly.**
+  Result files are written at `%.2f` precision, so re-scoring from `.txt` can flip a
+  match whose IoU sits within ~1e-4 of the 0.5 threshold. Measured over the seven
+  SORT sequences, the largest per-sequence disagreement is **0.0017 HOTA**
+  (4th decimal place) and **0.014 MOTA** (3rd), consistent with quantisation alone; the
+  metric path itself is reproducible. It is a debugging and re-scoring tool rather
+  than a substitute for the in-run metrics, since it cannot see detections that
+  `min_hits` suppressed before they were ever written.
+- **The occlusion tracker is ~6.5x slower end-to-end.** The published per-sequence
+  timings are 1.8–2.0 fps against SORT's 13.1–14.8 fps, so a seven-sequence
+  benchmark takes 41 min instead of 6.3. The cost scales with sequence length and
+  track count, which points at per-track numpy association work rather than
+  detection (the appearance encoder is already on the GPU) — but that attribution is
+  inference. No CPU/GPU utilisation profile was recorded, so the specific split is
+  not measured. MOT17-05 is the outlier at 8.0 fps, and the reason is not
+  established here.
 
 ---
 
@@ -258,10 +299,10 @@ Recording these because they cost time and constrain the design:
 
 ```bash
 ./venv/bin/pip install -r requirements.txt        # CUDA 13.0 wheels; see requirements.txt
-./venv/bin/pip install -r requirements.txt        # (uv needs --index-strategy unsafe-best-match)
-./venv/bin/python tests/run_all.py                # 35 tests, 4 suites
+./venv/bin/python tests/run_all.py                # 60 tests, 5 suites
 ./scripts/run_full_benchmark.sh                   # both trackers, all 7 sequences
-PYTHONPATH=src ./venv/bin/python scripts/detector_ceiling.py --configs conf-sweep
+PYTHONPATH=src ./venv/bin/python scripts/detector_ceiling.py \
+    --sequence 02 --configs conf-sweep --out results/detector_ceiling_02.json
 ```
 
 The benchmark takes roughly 6–7 minutes for SORT and 45–50 minutes for the occlusion
@@ -271,7 +312,35 @@ tracker at `imgsz=1600` on one RTX 5060.
 
 - Absolute metrics depend on the GPU and on `yolo11x` weight drift; the *ranking*
   (SORT vs occlusion) is what this project claims.
-- HOTA here is the paper's single-class form, not TrackEval's log-Jaccard association
-  aggregation, so absolute HOTA is not comparable to published TrackEval numbers.
-- Metrics recomputed from `.txt` differ slightly from `metrics.json` for the
-  `%.2f` reason in §1.4.
+- HOTA follows the TrackEval formulation (association via a sequence-wide Jaccard over
+  global `(gt id, tracker id)` pairs, per-frame assignment driven by that global
+  alignment score), and the implementation is cross-checked against an independent
+  transcription and hand-computed cases in `tests/test_metrics.py`. **But the class
+  convention differs from the official MOTChallenge protocol**, so the values are
+  *not* directly comparable to published HOTA numbers. This project treats classes
+  1/2/4/7 as targets; the official protocol scores class 1 only (MOT17-02 has 18,581
+  class-1 boxes against this project's 26,960 evaluated targets). Measured on
+  *identical* SORT hypothesis files, restricting ground truth to class 1 alone shifts
+  per-sequence HOTA by **+0.08 to +2.38 (mean +0.91)** — larger than some of the
+  effects discussed above. TrackEval additionally deletes hypotheses matched to
+  distractor classes, which pushes the offset slightly the other way. Treat
+  cross-paper comparisons as invalid until the class sets are normalised.
+- Aggregation is mixed, and conflating the two schemes is itself a silent bug. The
+  MOTChallenge rates are **pooled** from summed event counts, MOTP is
+  **match-weighted**, and IDF1 is **recomputed** from pooled `idtp`/`idfp`/`idfn` —
+  these coincide with TrackEval's `COMBINED_SEQ`. **HOTA and its components are an
+  unweighted sequence mean**, which is *not*: TrackEval pools per-alpha TP counts and
+  association sums across sequences and recomputes. So `OVERALL` MOTA is a valid
+  TrackEval-style combined score while `OVERALL` HOTA is not, and only the latter must
+  not be presented as a TrackEval combined value. The gap is material, not cosmetic —
+  for SORT, pooled MOTA is 34.87 against a sequence mean of 32.07.
+- Ignore regions are applied to hypotheses only (see `README.md`). Ground-truth boxes
+  centred inside an ignore region still count as missed targets. Measured over the seven
+  SORT sequences, excluding those ground-truth boxes as well moves HOTA by **+0.91 on
+  average**, ranging from **−0.14 (MOT17-09)** to **+2.16 (MOT17-04)**, and MOTA by
+  **−0.83 on average**, reaching **−6.36 (MOT17-09)**. HOTA is the steadier of the
+  two, but not steady enough to ignore: MOT17-04's +2.16 is ~10% of this project's
+  21.5 HOTA baseline.
+- Metrics recomputed from `.txt` agree with `metrics.json` to within 0.002 HOTA and
+  0.015 MOTA per sequence; the residual is `%.2f` quantisation, not a metric
+  disagreement.

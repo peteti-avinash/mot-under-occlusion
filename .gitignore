@@ -22,3 +22,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Secrets (none exist today; defensive)
+.env

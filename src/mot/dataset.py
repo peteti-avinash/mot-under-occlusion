@@ -142,8 +142,20 @@ def read_frame(seq, frame_id, cache):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def _parse_row(line, path, lineno):
+    """One MOT-format row -> list of floats, with errors that name the file.
+
+    A bare ``IndexError``/``ValueError`` from here leaves the caller guessing
+    which of thousands of rows is malformed, so the location is carried.
+    """
+    try:
+        return [float(v) for v in line.replace(" ", "").split(",")]
+    except ValueError as exc:
+        raise ValueError(f"{path}:{lineno}: non-numeric MOT row: {line!r}") from exc
+
+
 def read_boxes(path, distractor_classes=(0,), keep_classes=None,
-               min_confidence=0.0):
+               min_confidence=0.0, require_class=False):
     """Parse a MOT-format txt (ground truth or detections).
 
     Returns a dict ``frame_id -> (N, 6) array`` of
@@ -153,12 +165,24 @@ def read_boxes(path, distractor_classes=(0,), keep_classes=None,
         return {}
     frames = {}
     with open(path, "r") as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
-            p = [float(v) for v in line.replace(" ", "").split(",")]
+            p = _parse_row(line, path, lineno)
+            if len(p) < 6:
+                raise ValueError(
+                    f"{path}:{lineno}: MOT row needs at least 6 columns "
+                    f"(frame,id,x,y,w,h), got {len(p)}: {line!r}")
             frame_id = int(p[0])
+            if require_class and len(p) < 8:
+                # Detection files legitimately stop at 7 columns, ground truth
+                # does not. Without a class column the eval-class filter cannot
+                # run, and the same row would also be read back as an ignore
+                # region by read_ignore_regions -- silently unmatchable.
+                raise ValueError(
+                    f"{path}:{lineno}: ground-truth row needs a class column "
+                    f"(>=8 columns), got {len(p)}: {line!r}")
             if distractor_classes and len(p) >= 8 and int(p[7]) in distractor_classes:
                 continue
             if keep_classes is not None and len(p) >= 8:
@@ -184,7 +208,8 @@ def read_gt(path):
     for class 1. Filtering on ``conf == 1`` therefore silently drops crowds,
     riders and static people, so the class list is the correct filter.
     """
-    return read_boxes(path, distractor_classes=(), keep_classes=MOT17_EVAL_CLASSES)
+    return read_boxes(path, distractor_classes=(), keep_classes=MOT17_EVAL_CLASSES,
+                      require_class=True)
 
 
 def read_ignore_regions(path):
@@ -199,11 +224,15 @@ def read_ignore_regions(path):
     if not os.path.exists(path):
         return regions
     with open(path, "r") as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
-            p = [float(v) for v in line.replace(" ", "").split(",")]
+            p = _parse_row(line, path, lineno)
+            if len(p) < 8:
+                raise ValueError(
+                    f"{path}:{lineno}: ignore-region row needs a class column "
+                    f"(>=8 columns), got {len(p)}: {line!r}")
             cls = int(p[7]) if len(p) > 7 else 0
             if cls in MOT17_EVAL_CLASSES:
                 continue

@@ -133,13 +133,13 @@ class KalmanFilter:
         measurement = np.asarray(measurement, dtype=np.float64).reshape(4, 1)
         innovation_cov = np.diag(np.square(self.measurement_std(mean)))
         projected_mean, projected_cov = self.project(mean, covariance)
-        chol_factor, lower = _cholesky_factor(projected_cov, sigma=1e-4)
+        chol_factor = _cholesky_factor(projected_cov, sigma=1e-4)
         kalman_gain = solve_triangular(
             chol_factor.T,
             solve_triangular(
                 chol_factor,
                 (covariance @ self._update_mat.T).T,
-                lower=lower,
+                lower=False,
                 trans="T",
             ),
             lower=False,
@@ -162,9 +162,9 @@ class KalmanFilter:
         measurements = np.asarray(measurements, dtype=np.float32).reshape(-1, 4)
         if measurements.shape[0] == 0:
             return np.zeros((0,), dtype=np.float32)
-        chol_factor, lower = _cholesky_factor(covariance, sigma=1e-4)
+        chol_factor = _cholesky_factor(covariance, sigma=1e-4)
         d = measurements - mean.T
-        z = solve_triangular(chol_factor, d.T, lower=lower, trans="T")
+        z = solve_triangular(chol_factor, d.T, lower=False, trans="T")
         return np.sum(z * z, axis=0)
 
     def velocity_covariance(self, covariance):
@@ -184,6 +184,10 @@ def _cholesky_factor(matrix, sigma=0.1, tries=4):
     and safer than silently returning garbage distances. Jitter only repairs
     matrices that are *positive semi*-definite, so the last resort is an
     eigenvalue clip, which is guaranteed to yield a factor.
+
+    Returns the upper-triangular factor ``L`` with ``P ~= L.T @ L``. There is no
+    ``lower`` return value: every path goes through ``np.linalg.cholesky``, which
+    is upper triangular by definition, so callers always use ``lower=False``.
     """
     matrix = np.asarray(matrix, dtype=np.float64)
     matrix = 0.5 * (matrix + matrix.T)
@@ -194,14 +198,14 @@ def _cholesky_factor(matrix, sigma=0.1, tries=4):
     result = matrix
     for i in range(tries):
         try:
-            return np.linalg.cholesky(result).T, False
+            return np.linalg.cholesky(result).T
         except np.linalg.LinAlgError:
             sigma_i = sigma ** (i + 1) * scale
             result = result + sigma_i * eye
     values, vectors = np.linalg.eigh(result)
     values = np.clip(values, sigma * scale, None)
     repaired = vectors @ np.diag(values) @ vectors.T
-    return np.linalg.cholesky(repaired).T, False
+    return np.linalg.cholesky(repaired).T
 
 
 def convert_bbox_to_z(bbox):

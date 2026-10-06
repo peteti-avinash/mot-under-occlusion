@@ -12,9 +12,16 @@ for honest numbers on MOT17:
    pedestrians; crowds, riders and static people carry ``conf == 0``. Filtering
    on confidence therefore silently drops most targets. We filter on the MOT17
    "consider" class list instead (see :mod:`mot.dataset`).
-3. **Aggregation.** MOTA/MOTP/HOTA are averaged over sequences, the way the
-   leaderboard does it, while ID switches and fragmentations are summed because
-   they are counts.
+3. **Aggregation.** Two schemes, and conflating them is a silent bug. The
+   MOTChallenge rates are *pooled*: MOTA/precision/recall are recomputed once from
+   the summed event counts, MOTP is weighted by matches, IDF1 is recomputed from
+   pooled ``idtp``/``idfp``/``idfn``, and count metrics are summed. Averaging MOTA
+   over sequences instead weights a 525-frame sequence equally with a 3750-frame
+   one and can even disagree in sign. HOTA and its components have no count to
+   pool, so they are an unweighted sequence mean -- which is *not* TrackEval's
+   ``COMBINED_SEQ``, which pools per-alpha TP counts and association sums and
+   recomputes. So a pooled ``OVERALL`` MOTA is a valid TrackEval-style combined
+   score while ``OVERALL`` HOTA is a different quantity; do not quote it as one.
 
 ``evaluate_identity_check`` is the guard rail: feeding ground truth back in as
 hypotheses must return MOTA 1.0, HOTA 1.0 and zero ID switches. Any deviation
@@ -144,105 +151,150 @@ def filter_ignored(hypotheses, ignore_regions, frac_thresh=0.5):
 def hota(hypotheses, gt, num_frames, alphas=HOTA_ALPHAS):
     """Single-class HOTA, DetA and AssA averaged over ``alphas``.
 
-    Written out from the HOTA paper so the definition is auditable. MOT17 is
-    scored as one "person" class, so boxes carry only a track id in column 0
-    and the class sums collapse. For IoU threshold ``a``:
+    This is the TrackEval formulation, transcribed from
+    ``trackeval/metrics/hota.py`` and validated two ways: against three
+    hand-computed cases (perfect identity, one switch, a new id per frame) and
+    against an independent transcription of the same algorithm kept in
+    ``tests/test_metrics.py``.
 
-        DetA(t,a) = TP / (TP + FN + FP)
-        AssA(c,t,a) = TP / (TP + H + M)        # for each matched gt c
-        A(a)      = sum_t sum_c DetA(t,a) * AssA(c,t,a)
-        HOTA(a)   = sqrt(A(a)) / (sqrt(TP) + sqrt(FN) + sqrt(FP))
-        DetA(a)   = TP / (TP + FN + FP)
-        AssA(a)   = A(a) / TP
+    MOT17 is scored as one "person" class, so boxes carry only a track id in
+    column 0 and the class sums collapse. For IoU threshold ``a``:
 
-    ``H`` counts identity switches: gt ``c`` being matched to a track id
-    different from the one it was matched to previously. ``M`` counts a gt
-    matched to two detections in the same frame, which 1-to-1 Hungarian
-    matching makes impossible, so ``M`` is always 0. ``H`` is the entire point
-    of HOTA over DetA -- a tracker that finds every box but scrambles
-    identities must not score 1.0 -- so it must not be dropped.
+        TPA(c,t,a) = frames where gt ``c`` was matched to tracker ``t``
+        FNA(c,a)   = frames where gt ``c`` was present but unmatched
+        FPA(c,t,a) = frames where tracker ``t`` fired but not onto gt ``c``
+        A(c,t,a)   = TPA / (TPA + FNA + FPA)          # Jaccard, per id pair
+        AssA(a)    = sum_{c,t} TPA * A / TP
+        DetA(a)    = TP / (TP + FN + FP)
+        HOTA(a)    = sqrt(DetA * AssA)
 
-    Note this is the paper's single-class form. TrackEval aggregates the
-    association term slightly differently (a log-Jaccard over global id pairs),
-    so absolute HOTA will differ by a small margin from published TrackEval
-    numbers while ranking order is preserved.
+    ``A`` is the whole point of HOTA over DetA: a tracker that finds every box
+    but hands each gt a different id scores AssA -> 1/TP, not 1.0.
+
+    Two implementation details are load-bearing and easy to get backwards.
+
+    First, ``FPA`` is *not* a count of false positives -- it counts a tracker's
+    detections on frames where the gt it had claimed was not its match. The
+    Jaccard denominator ``gt_id_count + tracker_id_count - matches`` expresses
+    that directly, since ``gt_id_count`` is ``TPA + FNA`` and
+    ``tracker_id_count`` is ``TPA + FPA``.
+
+    Second, the per-frame Hungarian assignment is driven by
+    ``global_alignment_score * IoU``, not by IoU alone. The global alignment is
+    a first pass over the whole sequence that accumulates a Jaccard-ish
+    preference for each (gt id, tracker id) pair, so a track that has been
+    consistently matching one person wins ties against a track that happens to
+    overlap better on one frame. Matching on IoU alone lets identity flip
+    between two nearby people frame to frame.
+
+    Similarity is indexed as ``(num_gt_dets, num_tracker_dets)``, matching
+    TrackEval; transposing it silently produces a plausible wrong answer.
     """
-    alphas = np.asarray(alphas, dtype=np.float64)
+    alphas = np.atleast_1d(np.asarray(alphas, dtype=np.float64))
+    if alphas.size == 0:
+        raise ValueError("alphas must contain at least one threshold")
     n_alpha = alphas.size
-    num_gt_ids = _max_id(gt, {}) + 1
-    if num_gt_ids == 0:
+    eps = np.finfo("float").eps
+
+    gt_index = {}
+    for boxes in gt.values():
+        for row in boxes:
+            gt_index.setdefault(int(row[0]), len(gt_index))
+    hyp_index = {}
+    for boxes in hypotheses.values():
+        for row in boxes:
+            hyp_index.setdefault(int(row[0]), len(hyp_index))
+    num_gt_ids = len(gt_index)
+    num_hyp_ids = len(hyp_index)
+    if num_gt_ids == 0 or num_hyp_ids == 0:
         return 0.0, 0.0, 0.0
 
-    # Presence masks, so we can ask "was gt c annotated on frame t".
-    gt_present = np.zeros((num_gt_ids, num_frames), dtype=bool)
-    for frame_id, boxes in gt.items():
-        if frame_id > num_frames or boxes.shape[0] == 0:
+    # Per-frame id indices plus IoU, in one pass, shared by both passes below.
+    frames = []
+    for frame_id in range(1, num_frames + 1):
+        g = gt.get(frame_id)
+        d = hypotheses.get(frame_id)
+        g_rows = np.zeros((0, 4), dtype=np.float32)
+        g_ids = np.zeros(0, dtype=np.int64)
+        if g is not None and g.shape[0]:
+            g_ids = np.fromiter((gt_index[int(v)] for v in g[:, 0]),
+                                dtype=np.int64, count=g.shape[0])
+            g_rows = g[:, 1:5]
+        h_ids = np.zeros(0, dtype=np.int64)
+        h_rows = np.zeros((0, 4), dtype=np.float32)
+        if d is not None and d.shape[0]:
+            h_ids = np.fromiter((hyp_index[int(v)] for v in d[:, 0]),
+                                dtype=np.int64, count=d.shape[0])
+            h_rows = d[:, 1:5]
+        if g_ids.size and h_ids.size:
+            # iou_matrix(a, b) is (len(a), len(b)), so this is already
+            # (num_gt_dets, num_tracker_dets) as TrackEval indexes it.
+            # NaN/inf coordinates would poison the whole assignment below
+            # (scipy raises on non-finite entries), and an unmatchable box
+            # scoring zero is the same convention distance_matrix uses.
+            sim = np.nan_to_num(iou_matrix(g_rows, h_rows).astype(np.float64),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            sim = np.zeros((g_ids.size, h_ids.size), dtype=np.float64)
+        frames.append((g_ids, h_ids, sim))
+
+    # Pass 1: accumulate the global alignment score over the whole sequence.
+    potential = np.zeros((num_gt_ids, num_hyp_ids), dtype=np.float64)
+    gt_id_count = np.zeros((num_gt_ids, 1), dtype=np.float64)
+    hyp_id_count = np.zeros((1, num_hyp_ids), dtype=np.float64)
+    for g_ids, h_ids, sim in frames:
+        if g_ids.size and h_ids.size:
+            denom = sim.sum(0)[None, :] + sim.sum(1)[:, None] - sim
+            sim_jaccard = np.zeros_like(sim)
+            mask = denom > eps
+            sim_jaccard[mask] = sim[mask] / denom[mask]
+            # np.add.at, not fancy-index +=: a repeated id inside one frame
+            # must accumulate once per row, not once per unique index.
+            # TrackEval assumes unique ids per frame and gets this for free.
+            np.add.at(potential, (g_ids[:, None], h_ids[None, :]), sim_jaccard)
+        np.add.at(gt_id_count, (g_ids, np.zeros_like(g_ids)), 1.0)
+        np.add.at(hyp_id_count, (np.zeros_like(h_ids), h_ids), 1.0)
+    align_denom = gt_id_count + hyp_id_count - potential
+    with np.errstate(divide="ignore", invalid="ignore"):
+        global_align = np.where(align_denom > eps, potential / align_denom, 0.0)
+    global_align[~np.isfinite(global_align)] = 0.0
+
+    # Pass 2: match each frame, then score. ``tp_count`` is shared across
+    # alphas because the assignment is driven by the alignment score and does
+    # not depend on the threshold -- only the thresholding of its output does.
+    tp = np.zeros(n_alpha)
+    fn = np.zeros(n_alpha)
+    fp = np.zeros(n_alpha)
+    matches_count = [np.zeros((num_gt_ids, num_hyp_ids), dtype=np.float64)
+                     for _ in range(n_alpha)]
+
+    for g_ids, h_ids, sim in frames:
+        if not g_ids.size:
+            fp += len(h_ids)
             continue
-        for row in boxes:
-            gt_present[int(row[0]), frame_id - 1] = True
-    
+        if not h_ids.size:
+            fn += len(g_ids)
+            continue
+        score = global_align[g_ids[:, None], h_ids[None, :]] * sim
+        rows, cols = linear_sum_assignment(-score)
+        for ai, alpha in enumerate(alphas):
+            keep = sim[rows, cols] >= alpha - eps
+            n_match = int(keep.sum())
+            tp[ai] += n_match
+            fn[ai] += len(g_ids) - n_match
+            fp[ai] += len(h_ids) - n_match
+            if n_match:
+                matches_count[ai][g_ids[rows[keep]], h_ids[cols[keep]]] += 1.0
 
-    hota_vals = np.zeros(n_alpha, dtype=np.float64)
-    det_a_vals = np.zeros(n_alpha, dtype=np.float64)
-    ass_a_vals = np.zeros(n_alpha, dtype=np.float64)
-
-    for ai, alpha in enumerate(alphas):
-        tp_total = 0
-        fn_total = 0
-        fp_total = 0
-        a_total = 0.0
-        # gt id -> track id it was last matched to, for the H (identity switch)
-        # penalty. Reset per alpha: a different threshold is a different
-        # matching, so switches are recounted for each one.
-        last_track_for_gt = {}
-
-        for frame_id in range(1, num_frames + 1):
-            g = gt.get(frame_id)
-            d = hypotheses.get(frame_id)
-            ng = 0 if g is None else g.shape[0]
-            nd = 0 if d is None else d.shape[0]
-            n_gts = int(gt_present[:, frame_id - 1].sum())
-
-            pairs = []
-            switch = {}
-            if ng and nd:
-                ious = iou_matrix(d[:, 1:5], g[:, 1:5])
-                viable = ious >= alpha
-                # Maximise the number of viable pairs first, then IoU: pairs
-                # below the threshold cost 0 so they are never preferred, and
-                # viable pairs cost strictly negative.
-                cost = np.where(viable, -(ious - alpha + 1.0), 0.0)
-                rows, cols = linear_sum_assignment(cost)
-                for r, c in zip(rows, cols):
-                    if not viable[r, c]:
-                        continue
-                    gt_id = int(g[c, 0])
-                    track_id = int(d[r, 0])
-                    previous = last_track_for_gt.get(gt_id)
-                    switch[gt_id] = (previous is not None and previous != track_id)
-                    last_track_for_gt[gt_id] = track_id
-                    pairs.append(gt_id)
-
-            tp = len(pairs)
-            fn = n_gts - tp
-            fp = nd - tp
-            tp_total += tp
-            fn_total += fn
-            fp_total += fp
-            if tp:
-                det_a = tp / (tp + fn + fp)
-                for gt_id in pairs:
-                    # M == 0 under 1-to-1 matching, so AssA = 1 / (1 + H).
-                    a_total += det_a / (1.0 + float(switch[gt_id]))
-
-        denom = np.sqrt(tp_total) + np.sqrt(fn_total) + np.sqrt(fp_total)
-        hota_vals[ai] = np.sqrt(a_total) / denom if denom > 0 else 0.0
-        dsum = tp_total + fn_total + fp_total
-        det_a_vals[ai] = tp_total / dsum if dsum > 0 else 0.0
-        ass_a_vals[ai] = a_total / tp_total if tp_total > 0 else 0.0
-
-    return (float(hota_vals.mean()), float(det_a_vals.mean()),
-            float(ass_a_vals.mean()))
+    ass_a = np.zeros(n_alpha)
+    det_a = np.zeros(n_alpha)
+    for ai in range(n_alpha):
+        m = matches_count[ai]
+        pair_score = m / np.maximum(1.0, gt_id_count + hyp_id_count - m)
+        ass_a[ai] = np.sum(m * pair_score) / max(1.0, tp[ai])
+        det_a[ai] = tp[ai] / max(1.0, tp[ai] + fn[ai] + fp[ai])
+    hota_vals = np.sqrt(det_a * ass_a)
+    return (float(hota_vals.mean()), float(det_a.mean()), float(ass_a.mean()))
 
 
 def distance_matrix(det_boxes_xywh, gt_boxes_xywh, distth=0.5):

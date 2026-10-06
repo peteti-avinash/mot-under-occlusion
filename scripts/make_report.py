@@ -45,8 +45,8 @@ def _fmt(key, value):
 
 def per_sequence_table(sort_rows, occ_rows):
     header = ("| sequence | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML "
-              "| Rec | Prec |")
-    rule = "| --- " * 11 + "|"
+              "| Rec | Prec | Matches |")
+    rule = "| --- " * 12 + "|"
     lines = [header, rule]
     for seq in sorted(set(sort_rows) | set(occ_rows)):
         cells = []

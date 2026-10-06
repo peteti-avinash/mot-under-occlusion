@@ -280,15 +280,14 @@ def test_kalman_update_recovers_from_indefinite_covariance():
     # covariance may legitimately still be indefinite. What must hold is that
     # the *next* frame can be factored, which is what `_cholesky_factor` is for.
     _, projected = kf.project(mean, covariance)
-    factor, lower = _cholesky_factor(projected)
+    factor = _cholesky_factor(projected)
     assert np.allclose(factor, np.triu(factor))
-    assert not lower
 
 
 def test_cholesky_fallback_handles_indefinite_input():
     """Jitter cannot repair a matrix with large negative eigenvalues."""
     matrix = np.array([[1.0, 2.0], [2.0, 1.0]])  # eigenvalues -1 and 3
-    factor, _ = _cholesky_factor(matrix)
+    factor = _cholesky_factor(matrix)
     assert np.allclose(factor, np.triu(factor)), "factor is not upper triangular"
     rebuilt = factor.T @ factor
     assert np.allclose(rebuilt, rebuilt.T, atol=1e-9), "rebuilt matrix is asymmetric"
