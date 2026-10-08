@@ -142,6 +142,59 @@ def read_frame(seq, frame_id, cache):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def _dets_cache_path(cache_dir, seq_name):
+    return Path(cache_dir) / f"{seq_name}.npz"
+
+
+def load_dets_cache(cache_dir, seq_name, expected_frames):
+    """Cached detections for one sequence as ``frame_id -> (N, 5)``.
+
+    Rows are ``[x, y, w, h, conf]`` in the same clipped TLWH form the live
+    pipeline produces. A cache covering fewer frames than the sequence expects
+    is treated as stale (left over from a ``--max-frames`` debug run) and
+    returns ``None`` so the caller live-detects instead of mixing operating
+    points.
+    """
+    if not cache_dir:
+        return None
+    path = _dets_cache_path(cache_dir, seq_name)
+    if not path.exists():
+        return None
+    data = np.load(path)["dets"]
+    if data.ndim == 1:
+        # placeholder file? treat as incomplete
+        return None
+    arr = data
+    frames = np.unique(arr[:, 0].astype(int))
+    if len(frames) < expected_frames:
+        return None
+    out = {}
+    for row in arr:
+        x,y,w,h,c = row[1:]
+        if w <= 0 or h <= 0:
+            continue
+        out.setdefault(int(row[0]), []).append(row[1:])
+    return {k: np.asarray(v, dtype=np.float32) for k, v in out.items()}
+
+
+def save_dets_cache(cache_dir, seq_name, frame_dets, expected_frames):
+    """Persist freshly detected frames as one ``(N, 6)`` array.
+
+    Rows are ``[frame_id, x, y, w, h, conf]``. Writing once per sequence keeps
+    the loader's staleness check (``expected_frames``) meaningful.
+    """
+    if not cache_dir or not frame_dets:
+        return
+    rows = []
+    for frame_id, boxes, scores in frame_dets:
+        for i in range(boxes.shape[0]):
+            rows.append([frame_id, *boxes[i], scores[i]])
+    path = _dets_cache_path(cache_dir, seq_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, dets=np.asarray(rows, dtype=np.float32),
+                        n_frames=expected_frames)
+
+
 def _parse_row(line, path, lineno):
     """One MOT-format row -> list of floats, with errors that name the file.
 

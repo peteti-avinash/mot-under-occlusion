@@ -26,7 +26,9 @@ from mot.dataset import (
     MOT17_EVAL_CLASSES,
     find_dataset_root,
     list_sequences,
+    load_dets_cache,
     read_frame,
+    save_dets_cache,
     write_results,
 )
 from mot.detector import YoloDetector, clip_boxes, xyxy_to_tlwh
@@ -54,18 +56,27 @@ def build_tracker(name, seq, args):
             appearance_weight=args.appearance_weight,
             gallery_size=args.gallery_size,
             reid_max_age=args.reid_max_age,
+            enable_reid=not args.no_reid,
+            cascade=not args.no_cascade,
         )
     return cls(**kwargs)
 
 
-def run_sequence(seq, args, detector, encoder, tracker_name):
+def run_sequence(seq, args, detector, encoder, tracker_name, cache_dir=None):
     """Track one sequence.
 
     Returns ``(rows, hypotheses, wall_seconds)`` where ``rows`` are MOT-format
     output rows and ``hypotheses`` is the ``frame_id -> (N, 6)`` array layout the
     evaluator expects.
+
+    When ``cache_dir`` is set, per-frame detections are read from (and written
+    to) ``<cache_dir>/<seq.name>.npz`` so every tracker config runs on
+    byte-identical detector output; a cache that covers fewer frames than the
+    sequence is treated as stale and ignored.
     """
     cache = {}
+    dets_cache = load_dets_cache(cache_dir, seq.name, seq.length)
+    fresh_dets = []
     tracker = build_tracker(tracker_name, seq, args)
     tracker.reset()
 
@@ -74,12 +85,20 @@ def run_sequence(seq, args, detector, encoder, tracker_name):
     t0 = time.perf_counter()
     report_every = max(1, seq.length // 5)
     for frame_id in range(1, seq.length + 1):
-        image = read_frame(seq, frame_id, cache)
-        boxes_xyxy, scores, _ = detector.detect(image)
-        boxes = clip_boxes(xyxy_to_tlwh(boxes_xyxy), image.shape[1], image.shape[0])
+        if dets_cache is not None and frame_id in dets_cache:
+            boxes = dets_cache[frame_id][:, :4]
+            scores = dets_cache[frame_id][:, 4]
+        else:
+            image = read_frame(seq, frame_id, cache)
+            boxes_xyxy, scores, _ = detector.detect(image)
+            boxes = clip_boxes(xyxy_to_tlwh(boxes_xyxy),
+                               image.shape[1], image.shape[0])
+            if cache_dir is not None:
+                fresh_dets.append((frame_id, boxes, scores))
 
         features = None
         if encoder is not None and boxes.shape[0]:
+            image = read_frame(seq, frame_id, cache)
             features = encoder.encode_batch(image, boxes)
 
         detections = [
@@ -108,6 +127,8 @@ def run_sequence(seq, args, detector, encoder, tracker_name):
                   f"{done:.0f}s  ({frame_id / done:.1f} fps)  "
                   f"{len(detections)} dets  {len(tracker.tracks)} tracks",
                   flush=True)
+    if cache_dir is not None and fresh_dets:
+        save_dets_cache(cache_dir, seq.name, fresh_dets, seq.length)
     return rows, hypotheses, time.perf_counter() - t0
 
 
@@ -139,6 +160,15 @@ def main(argv=None):
     ap.add_argument("--reid-max-age", type=int, default=45)
     ap.add_argument("--no-appearance", action="store_true",
                     help="ablation: disable the appearance cue")
+    ap.add_argument("--no-reid", action="store_true",
+                    help="ablation: disable the Lost-track re-identification stage")
+    ap.add_argument("--no-cascade", action="store_true",
+                    help="ablation: replace the age-ordered cascade with one "
+                         "global Hungarian assignment")
+    ap.add_argument("--dets-cache", default=None,
+                    help="directory of cached detection .npz files; cached "
+                         "frames replace live detection so every tracker "
+                         "config sees byte-identical input")
     ap.add_argument("--out-dir", default="results")
     ap.add_argument("--tag", default=None,
                     help="output subdirectory; defaults to the tracker name")
@@ -189,7 +219,8 @@ def main(argv=None):
     results = []
     for seq in seqs:
         print(f"\n=== {seq.name} ({seq.length} frames) ===", flush=True)
-        rows, hyp, secs = run_sequence(seq, args, detector, encoder, args.tracker)
+        rows, hyp, secs = run_sequence(seq, args, detector, encoder,
+                                       args.tracker, cache_dir=args.dets_cache)
         fps = seq.length / secs if secs else 0.0
         print(f"tracked in {secs:.1f}s ({fps:.1f} fps, detector+tracker+appearance)")
 

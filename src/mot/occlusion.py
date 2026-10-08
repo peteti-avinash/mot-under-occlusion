@@ -26,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 
 from scipy.linalg import solve_triangular
+from scipy.optimize import linear_sum_assignment
 
 from .associate import (
     cosine_distance_matrix,
@@ -56,11 +57,20 @@ class OcclusionAwareTracker:
                  match_gate=9.0,
                  reid_min_iou=0.0,
                  gallery_size=30,
-                 frame_rate=30):
+                 frame_rate=30,
+                 enable_reid=True,
+                 cascade=True):
         self.max_age = max_age
         self.min_hits = min_hits
         self.n_init = n_init
         self.det_conf_threshold = det_conf_threshold
+        # Ablation switches. ``enable_reid`` drops the Lost-track recovery
+        # stage. ``cascade=False`` replaces the oldest-first sequential
+        # association with one global Hungarian assignment over every track at
+        # once, keeping the same costs and gates, so the ablation isolates the
+        # cascade *ordering* rather than the cost function.
+        self.enable_reid = enable_reid
+        self.cascade = cascade
 
         # Matching weights.
         self.appearance_weight = appearance_weight
@@ -119,9 +129,12 @@ class OcclusionAwareTracker:
             t.predict(self.kf)
 
         matches, unmatched_tracks, unmatched_dets = self._cascade_match(keep)
-        reid_pairs, unmatched_tracks, unmatched_dets = self._reid_match(
-            keep, unmatched_tracks, unmatched_dets
-        )
+        if self.enable_reid:
+            reid_pairs, unmatched_tracks, unmatched_dets = self._reid_match(
+                keep, unmatched_tracks, unmatched_dets
+            )
+        else:
+            reid_pairs = []
 
         for ti, di in matches:
             self.tracks[ti].update(
@@ -176,6 +189,9 @@ class OcclusionAwareTracker:
         reduced problem after every accepted pair, but it is far cheaper and
         makes the cascade semantics explicit.
         """
+        if not self.cascade:
+            return self._global_match(detections)
+
         available = list(range(len(detections)))
         matches = []
 
@@ -231,6 +247,52 @@ class OcclusionAwareTracker:
                             if i not in matched_tracks]
         return matches, np.array(unmatched_tracks, dtype=int), \
             np.array(available, dtype=int)
+
+    def _global_match(self, detections):
+        """One-shot Hungarian assignment over every track at once.
+
+        This is SORT's association shape, kept on the same cost and gates as
+        the cascade so the only difference in an ablation is the matching
+        *order*: sequential oldest-first vs one global optimum. Pairs whose
+        combined cost/gate are inadmissible get a large finite cost and are
+        rejected after the assignment, since ``linear_sum_assignment`` cannot
+        be given ``inf`` entries.
+        """
+        n_t, n_d = len(self.tracks), len(detections)
+        if n_t == 0 or n_d == 0:
+            return [], np.arange(n_t, dtype=int), np.arange(n_d, dtype=int)
+
+        det_boxes = np.array([d.tlwh for d in detections], dtype=np.float32)
+        t_boxes = np.array([t.bbox for t in self.tracks], dtype=np.float32)
+        costs = iou_cost(t_boxes, det_boxes)
+        for i, t in enumerate(self.tracks):
+            ap = self._appearance_distance(t, detections, list(range(n_d)))
+            if ap is not None:
+                costs[i:i + 1] = fuse_cost(costs[i:i + 1],
+                                           ap.reshape(1, -1),
+                                           self.appearance_weight)
+
+        masked = np.full((n_t, n_d), 1e5, dtype=np.float64)
+        for i, t in enumerate(self.tracks):
+            if t.state == TrackState.Deleted:
+                continue
+            iou_gate = self._gate(t)
+            mahalanobis_gate = max(self.match_gate,
+                                   iou_gate * self.gate_multiplier + 2.0)
+            admissible = (costs[i] <= iou_gate) & _mahalanobis_ok(
+                t, det_boxes, mahalanobis_gate, kf=self.kf
+            )
+            masked[i, admissible] = costs[i, admissible]
+
+        rows, cols = linear_sum_assignment(masked)
+        matches = [[int(i), int(j)] for i, j in zip(rows, cols)
+                   if masked[i, j] < 1e4]
+        matched_tracks = {ti for ti, _ in matches}
+        used_dets = {di for _, di in matches}
+        unmatched_tracks = [i for i in range(n_t) if i not in matched_tracks]
+        unmatched_dets = [di for di in range(n_d) if di not in used_dets]
+        return matches, np.array(unmatched_tracks, dtype=int), \
+            np.array(unmatched_dets, dtype=int)
 
     def _gate(self, track):
         """Adaptive IoU-cost threshold based on the track's own uncertainty.

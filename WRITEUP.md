@@ -344,3 +344,22 @@ tracker at `imgsz=1600` on one RTX 5060.
 - Metrics recomputed from `.txt` agree with `metrics.json` to within 0.002 HOTA and
   0.015 MOTA per sequence; the residual is `%.2f` quantisation, not a metric
   disagreement.
+## SOTA comparison (MOT17-FRCNN, full 7 sequences)
+
+| Tracker | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ByteTrack | 40.89 | 81.13 | 40.39 | 0.490 | 644 | 1628 | 17.7 | 26.7 | 47.73 | 87.76 |
+| OC-SORT | 40.60 | 81.74 | 40.89 | 0.517 | 561 | 1972 | 16.4 | 27.0 | 47.30 | 87.86 |
+| BoT-SORT | 41.10 | 82.01 | 42.38 | 0.512 | 320 | 1394 | 18.4 | 28.4 | 46.55 | 89.68 |
+| Occlusion-Aware (ours) | 39.66 | 81.09 | 32.01 | 0.379 | 2204 | 3315 | 17.1 | 23.1 | 49.11 | 84.79 |
+| SORT (ours baseline) | 34.87 | 82.43 | 21.51 | 0.267 | 3017 | 3635 | 6.1 | 38.9 | 40.97 | 88.48 |
+
+## Ablation study (MOT17-FRCNN, full 7 sequences)
+
+| Configuration | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Full (ours) | 39.66 | 81.09 | 32.01 | 0.379 | 2204 | 3315 | 17.1 | 23.1 | 49.11 | 84.79 |
+| w/o appearance | 39.48 | 81.13 | 31.61 | 0.369 | 2376 | 3324 | 16.9 | 23.7 | 48.69 | 85.09 |
+| w/o REID recovery | 39.61 | 81.13 | 31.85 | 0.370 | 2210 | 3323 | 16.9 | 23.4 | 48.79 | 85.09 |
+| w/o cascade (Hungarian) | 39.81 | 81.05 | 31.26 | 0.388 | 1730 | 3059 | 21.3 | 23.3 | 49.76 | 84.03 |
+

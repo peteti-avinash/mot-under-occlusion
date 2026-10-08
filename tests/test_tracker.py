@@ -377,5 +377,88 @@ def main():
     return run_tests(dict(globals()), "tracker")
 
 
+def test_global_hungarian_matches_one_to_one():
+    """cascade=False must produce the same one-to-one pairing as the cascade.
+
+    Two mature tracks side by side, two detections obviously above them: both
+    association shapes must match both tracks and leave nothing unmatched.
+    """
+    det1 = Detection(_box(101, 180), 0.9)
+    det2 = Detection(_box(301, 180), 0.9)
+    pairs = []
+    for use_cascade in (True, False):
+        tr = OcclusionAwareTracker(min_hits=1, enable_reid=False,
+                                   cascade=use_cascade)
+        tr.reset()
+        t1 = Track(_box(100, 180), 0.9, frame_id=1, min_hits=1, kf=tr.kf)
+        t2 = Track(_box(300, 180), 0.9, frame_id=1, min_hits=1, kf=tr.kf)
+        tr.tracks = [t1, t2]
+        for t in tr.tracks:
+            t.hits = 10
+        m, unmatched_t, unmatched_d = tr._cascade_match([det1, det2])
+        assert len(m) == 2, f"cascade={use_cascade}: matches {m}"
+        assert len(unmatched_t) == 0 and len(unmatched_d) == 0, (
+            f"cascade={use_cascade}: unmatched tracks {unmatched_t}, "
+            f"dets {unmatched_d} -- matched dets must not respawn as new tracks")
+        pairs.append(sorted((ti, di) for ti, di in m))
+    assert pairs[0] == pairs[1], f"pairings disagree: {pairs}"
+
+
+def test_global_hungarian_never_double_reports_dets():
+    """A matched detection must not also come back as unmatched.
+
+    The first cut of ``_global_match`` returned ``np.arange(n_d)``, so every
+    matched detection spawned a duplicate track and the ablation collapsed
+    (IDS 409, recall 17% on the 60-frame smoke). This pins the contract.
+    """
+    tr = OcclusionAwareTracker(min_hits=1, enable_reid=False, cascade=False)
+    tr.reset()
+    t1 = Track(_box(100, 180), 0.9, frame_id=1, min_hits=1, kf=tr.kf)
+    tr.tracks = [t1]
+    t1.hits = 10
+    det = Detection(_box(101, 180), 0.9)
+    m, unmatched_t, unmatched_d = tr._cascade_match([det])
+    assert m == [[0, 0]], f"matches {m}"
+    assert len(unmatched_d) == 0, (
+        f"matched det returned as unmatched: {unmatched_d}")
+
+
+def test_global_hungarian_solves_the_crossed_case():
+    """One global assignment must swap detections the greedy order cannot.
+
+    Track 0 sits at x=100, track 1 at x=300. The detection nearer track 1
+    arrives first; a global optimum pairs each track with its own detection.
+    """
+    tr = OcclusionAwareTracker(min_hits=1, enable_reid=False, cascade=False)
+    tr.reset()
+    t1 = Track(_box(100, 180), 0.9, frame_id=1, min_hits=1, kf=tr.kf)
+    t2 = Track(_box(300, 180), 0.9, frame_id=1, min_hits=1, kf=tr.kf)
+    tr.tracks = [t1, t2]
+    for t in tr.tracks:
+        t.hits = 10
+    det_near_t1 = Detection(_box(302, 180), 0.9)   # x=302: nearer track 1
+    det_near_t0 = Detection(_box(99, 180), 0.9)    # x=99:  nearer track 0
+    m, _, _ = tr._cascade_match([det_near_t1, det_near_t0])
+    got = {ti: di for ti, di in m}
+    # track 0 -> det 1 (x=99), track 1 -> det 0 (x=302)
+    assert got == {0: 1, 1: 0}, f"crossed pairing came out as {m}"
+
+
+def test_no_reid_disables_the_recovery_stage():
+    """enable_reid=False must never emit reid_recovery events or recovered hits."""
+    tracker = OcclusionAwareTracker(min_hits=1, max_age=5, enable_reid=False)
+    tracker.reset()
+    for _ in range(3):
+        tracker.update([Detection([70.0, 220.0, 60.0, 160.0], 0.9, _feat(1))])
+    track = tracker.tracks[0]
+    # Coast far past the reid window with a near-identical appearance
+    # detection available: with reid enabled this would recover the id.
+    for _ in range(8):
+        tracker.update([Detection([74.0, 220.0, 60.0, 160.0], 0.9, _feat(1))])
+    assert tracker.enable_reid is False
+    assert all(e["type"] != "reid_recovery" for e in tracker.events), (
+        "reid events emitted while enable_reid=False")
+    assert track.recovered == 0, f"recovered hits with reid disabled: {track.recovered}"
+
 if __name__ == "__main__":
     raise SystemExit(main())
