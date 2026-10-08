@@ -222,7 +222,9 @@ def main(argv=None):
         rows, hyp, secs = run_sequence(seq, args, detector, encoder,
                                        args.tracker, cache_dir=args.dets_cache)
         fps = seq.length / secs if secs else 0.0
-        print(f"tracked in {secs:.1f}s ({fps:.1f} fps, detector+tracker+appearance)")
+        timing_label = ("detector+tracker" if encoder is None
+                        else "detector+tracker+appearance")
+        print(f"tracked in {secs:.1f}s ({fps:.1f} fps, {timing_label})")
 
         metrics = evaluate(hyp, seq.gt_file, sequence=seq.name, max_frame=seq.length)
         print(format_table([metrics]))

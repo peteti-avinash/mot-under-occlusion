@@ -8,10 +8,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PYTHON = os.path.join(ROOT, "venv", "bin", "python")
+PYTHON = sys.executable
 
 SUITES = ("test_tracker.py", "test_detector.py", "test_metrics.py",
-          "test_aggregate.py", "test_detector_ceiling.py")
+          "test_aggregate.py", "test_detector_ceiling.py", "test_visualize.py")
 
 
 def main():

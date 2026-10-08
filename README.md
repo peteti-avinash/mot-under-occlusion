@@ -1,209 +1,222 @@
-# MOT17 under occlusion: SORT vs. an appearance-assisted re-identification tracker
+# Multi-Object Tracking Under Occlusion
 
-A from-scratch multi-object tracker evaluated on the MOT17 FRCNN sequences, built to
-answer one question honestly:
+This project compares a classic SORT baseline with a custom
+**appearance-assisted occlusion-aware tracker** on the MOT17 FRCNN training
+sequences. It uses a fixed, COCO-pretrained YOLO11 detector—no detector is
+trained from scratch—and asks whether retaining lost tracks and matching them
+with appearance information preserves identity through brief occlusions.
 
-> When a tracked pedestrian is occluded for a few seconds and re-emerges, can a tracker
-> recover the **same identity** — and how much does that cost in false positives?
+> This is not DeepSORT. The occlusion-aware tracker uses a generic
+> ImageNet-pretrained MobileNetV3-small descriptor plus HSV colour features;
+> it is not a person-ReID model trained on a ReID benchmark.
 
-The project runs a **fixed, off-the-shelf detector** (`yolo11x`) over MOT17 and swaps the
-tracker underneath, so every difference in the results table is attributable to
-association logic rather than to perception quality. No detector is trained here.
-
-## Results
-
-See [`WRITEUP.md`](WRITEUP.md) for the full benchmark tables, the failure analysis, and
-the negative results. Headline numbers are reproduced there.
-
-## What is in here
-
-| Path | What it does |
-| --- | --- |
-| `src/mot/detector.py` | `yolo11x` wrapper: batching, fp16, CUDA-OOM retry |
-| `src/mot/dataset.py` | MOT17 reader, class filtering, ignore regions |
-| `src/mot/appearance.py` | 1088-d appearance descriptor (MobileNetV3-small, HSV) |
-| `src/mot/kalman.py` | Kalman filter/covariance update with a robust Cholesky fallback |
-| `src/mot/track.py` | Track state machine (`Tentative`/`Confirmed`/`Lost`) |
-| `src/mot/sort.py` | SORT baseline: IoU + Kalman only |
-| `src/mot/occlusion.py` | Occlusion tracker: cascade association + re-ID |
-| `src/mot/metrics.py` | MOT metrics + HOTA (self-contained; see *Metrics* below) |
-| `src/mot/pipeline.py` | CLI that ties detector + tracker + evaluator together |
-| `tests/` | 60 tests across five suites, no pytest required |
-| `scripts/run_full_benchmark.sh` | Runs both trackers over all seven sequences |
-| `scripts/detector_ceiling.py` | Measures detection ceiling (no tracker) for the write-up |
-| `scripts/reevaluate.py` | Recomputes metrics from written `.txt` files, no GPU |
-| `scripts/make_report.py` | Renders the write-up's tables from `metrics.json` |
-
-## Setup
+## Quick Start
 
 ```bash
 python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Download the 5.5 GB MOT17 archive and extract it to data/MOT17/.
+mkdir -p data
+curl -L -o /tmp/MOT17.zip https://motchallenge.net/data/MOT17.zip
+unzip -q /tmp/MOT17.zip -d data
+
+# Download the fixed pretrained detector used by the recorded benchmark.
+curl -L -o yolo11x.pt \
+  https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11x.pt
+
+# Run one sequence with the two trackers.
+PYTHONPATH=src python -m mot.pipeline --dataset-root data/MOT17 \
+  --sequences 04 --tracker sort --out-dir results --tag sort
+PYTHONPATH=src python -m mot.pipeline --dataset-root data/MOT17 \
+  --sequences 04 --tracker occlusion --out-dir results --tag occlusion
+
+# Render the occlusion-aware tracks as an annotated MP4.
+PYTHONPATH=src python scripts/visualize.py --dataset-root data/MOT17 \
+  --sequence 04 --tracker occlusion --results-dir results \
+  --output results/visualizations/MOT17-04-occlusion.mp4
 ```
 
-`requirements.txt` pins the CUDA 13.0 build of PyTorch, so it installs from
-`download.pytorch.org` in addition to PyPI. `pip` handles that
-automatically; with `uv` you must pass `--index-strategy unsafe-best-match`,
-otherwise the resolver treats the PyTorch index as authoritative for unrelated
-packages (it ships its own NumPy) and fails:
+The official [MOT17 archive](https://motchallenge.net/data/MOT17/) extracts
+the expected `data/MOT17/train/MOT17-XX-FRCNN/{img1,gt}` layout. Data, model
+weights, videos, caches, logs, and results are intentionally ignored by Git.
 
-```bash
-uv pip install -r requirements.txt --index-strategy unsafe-best-match
-```
+## Architecture
 
-Detector weights are **not** committed. Fetch the one the benchmark uses before
-running:
+| System | Association and lifecycle |
+| --- | --- |
+| **SORT baseline** | Constant-velocity Kalman filter, IoU-cost Hungarian assignment, tentative/confirmed/lost lifecycle. |
+| **Occlusion-aware tracker** | Kalman prediction, age-ordered cascade association, generic appearance and HSV descriptor, lost-track gallery, Mahalanobis gating, and re-identification recovery. |
 
-```bash
-# yolo11x.pt must sit in the repository root
-curl -L -o yolo11x.pt https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11x.pt
-```
+The detector wrapper filters the COCO `person` class. The evaluator calculates
+MOTA, MOTP, IDF1, ID switches, precision, recall, and a self-contained HOTA
+implementation. MOTA, precision, recall, MOTP, and IDF1 are pooled from event
+counts; HOTA is a per-sequence mean and is **not** TrackEval's combined HOTA.
 
-`scripts/detector_ceiling.py --configs size-sweep` additionally uses `yolo11n`,
-`yolo11m` and `yolo11l`; it prints `SKIPPED` for any checkpoint you have not
-fetched.
+## Installation and Hardware
 
-MOT17 must be extracted so that `data/MOT17/train/MOT17-XX-FRCNN/` each contain
-`img1/` and `gt/gt.txt`. The reader also accepts a directory passed via
-`--dataset-root`.
+`requirements.txt` pins the CUDA 13.0 PyTorch build used for the recorded
+experiments. Install it with the commands above; the PyTorch wheel index is
+already declared in that file. The recorded configuration is `yolo11x` at
+`imgsz=1600`, which is demanding for an 8 GB laptop GPU. If it exhausts memory,
+use a smaller checkpoint or image size for exploratory runs, but do not compare
+those results directly with the recorded benchmark.
 
-## Running
+The detector weights are downloaded separately and are not committed. On first
+appearance-encoder use, torchvision may also download its ImageNet pretrained
+MobileNetV3-small weights.
 
-Single sequence, either tracker:
+## Running the Trackers
 
-```bash
-PYTHONPATH=src ./venv/bin/python -m mot.pipeline --sequences 02 --tracker occlusion
-```
-
-Both trackers over all seven FRCNN sequences, exactly as benchmarked:
+Run the complete seven-sequence FRCNN benchmark with the recorded configuration:
 
 ```bash
 ./scripts/run_full_benchmark.sh
 ```
 
-Useful flags (defaults in brackets):
+It writes per-sequence MOT text files and `metrics.json` under
+`results/full_sort/sort/` and `results/full_occlusion/occlusion/`. For smaller
+or reproducible iterative runs, cache detector output so both trackers consume
+the same detections:
 
-- `--weights [yolo11x.pt]` — any Ultralytics checkpoint
-- `--conf [0.25]`, `--imgsz [1600]` — detector inference settings
-- `--det-conf-threshold [0.3]` — only used to *start* new tracks; lower-score
-  detections still sustain existing ones
-- `--min-hits [3]`, `--max-age [30]` — track lifecycle
-- `--appearance-weight [0.6]`, `--gallery-size [30]`, `--reid-max-age [45]` — re-ID
-- `--no-appearance` — ablation: run the occlusion tracker with the appearance cue off
-- `--max-frames N` — debug: stop after N frames per sequence
+```bash
+PYTHONPATH=src python -m mot.pipeline --dataset-root data/MOT17 \
+  --sequences 04 --tracker sort --dets-cache results/dets_cache \
+  --out-dir results --tag sort
+PYTHONPATH=src python -m mot.pipeline --dataset-root data/MOT17 \
+  --sequences 04 --tracker occlusion --dets-cache results/dets_cache \
+  --out-dir results --tag occlusion
+```
 
-Output is MOT-format `results/<tag>/MOT17-XX-FRCNN.txt` plus a `metrics.json` summary.
+Useful options include `--max-frames N` for smoke runs, `--no-appearance`,
+`--no-reid`, and `--no-cascade` for ablations. Run `PYTHONPATH=src python -m
+mot.pipeline --help` for the complete CLI.
 
-`metrics.json` is authoritative. Its `aggregate` row pools the MOTChallenge rates
-from summed event counts, weights MOTP by matches, and recomputes IDF1 from
-pooled ID counts; only HOTA and its components are unweighted means over
-sequences (see *Metrics* below). Recomputing
-from the `.txt` files instead (`scripts/reevaluate.py`) reproduces those numbers
-to within 0.002 HOTA / 0.015 MOTA per sequence — the residual is `%.2f`
-quantisation of box coordinates shifting borderline IoU matches, not a
-disagreement. It still cannot see detections that `min_hits` suppressed before
-they were written, so it is a debugging tool rather than a substitute.
+## Evaluation
+
+Evaluate existing MOT-format outputs without a GPU or detector rerun:
+
+```bash
+PYTHONPATH=src python scripts/reevaluate.py \
+  --dataset-root data/MOT17 --results results/occlusion --tracker occlusion --write
+```
+
+Generate Markdown comparison tables from two `metrics.json` files:
+
+```bash
+PYTHONPATH=src python scripts/make_report.py \
+  --sort results/full_sort/sort/metrics.json \
+  --occlusion results/full_occlusion/occlusion/metrics.json
+```
+
+`metrics.json` emitted during a pipeline run is the authoritative record.
+Re-evaluation from `.txt` output can differ near the IoU boundary because boxes
+are serialized to two decimal places.
+
+## Trajectory Visualisation
+
+`scripts/visualize.py` reads frames plus an existing tracker-output file. It
+draws a stable colour per ID, bounding box, ID label, and a configurable recent
+centre-point trail. It does not rerun detection or tracking.
+
+```bash
+PYTHONPATH=src python scripts/visualize.py \
+  --sequence-dir data/MOT17/train/MOT17-04-FRCNN \
+  --results results/full_occlusion/occlusion/MOT17-04-FRCNN.txt \
+  --history 45 --start-frame 1 --end-frame 300 \
+  --output results/visualizations/MOT17-04-occlusion.mp4
+```
+
+The verified local run produced `MOT17-04-occlusion.mp4` with 1,050 annotated
+frames. Benchmark assets and generated videos are intentionally not versioned;
+the command above is the reproducible generation path.
+
+## Results and Failure Analysis
+
+The retained seven-sequence run uses `yolo11x.pt` and MOT17 FRCNN training
+sequences 02, 04, 05, 09, 10, 11, and 13. The authoritative local artifacts are
+`results/full_sort/sort/metrics.json` and
+`results/full_occlusion/occlusion/metrics.json`; they are ignored by Git so that
+the repository does not contain datasets, weights, or generated outputs.
+
+| Tracker | MOTA | HOTA | IDF1 | ID Switches | Recall | Precision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SORT | 34.87 | 21.51 | 0.267 | 3017 | 40.97 | 88.48 |
+| Occlusion-aware | 39.66 | 32.01 | 0.379 | 2204 | 49.11 | 84.79 |
+
+The occlusion-aware tracker improves MOTA by **4.79** points, HOTA by **10.50**
+points, and IDF1 by **0.112**, while reducing ID switches by **813** (about
+**26.95%**). Recall rises by **8.14** points, while precision falls by **3.69**
+points. Full results also report MOTP (82.43 / 81.09) and fragmentation (3635 /
+3315) for SORT / occlusion-aware. MOTA, precision, recall, MOTP, and IDF1 are
+pooled from event counts; HOTA is an unweighted sequence mean, not TrackEval's
+combined HOTA.
+
+Observed results and supported failure analysis:
+
+- **Temporary occlusion:** lost-track recovery can retain an ID, but long gaps
+  remain ambiguous.
+- **Fast motion:** a constant-velocity filter and gate can fail after abrupt
+  camera or pedestrian motion.
+- **Similar-looking pedestrians:** generic embeddings are not trained for
+  identity discrimination.
+- **Detector misses:** low detector recall caps every tracking metric.
+- **False detections and stale tracks:** retained tracks can trade recall and
+  ID continuity for lower precision.
+- **ID switches:** the recorded run measures 3,017 SORT switches and 2,204
+  occlusion-aware switches; individual causes require sequence-level review.
+
+The evaluation protocol treats MOT17 classes 1/2/4/7 as targets and suppresses
+hypotheses in ignored regions. It therefore is not directly comparable to the
+official MOTChallenge protocol, which uses a different class convention.
+
+## Optional Baselines
+
+`scripts/run_baselines.py` can run ByteTrack, OC-SORT, and BoT-SORT on cached
+detections, but it is optional and needs an additional package:
+
+```bash
+pip install boxmot
+PYTHONPATH=src python scripts/run_baselines.py --dataset-root data/MOT17 \
+  --dets-cache results/dets_cache --out results/sota
+```
+
+Do not call a BoxMOT comparison reproducible until its result JSON and exact
+package version have been retained alongside the experiment record.
 
 ## Tests
 
 ```bash
-PYTHONPATH=src ./venv/bin/python tests/run_all.py
+PYTHONPATH=src python tests/run_all.py
 ```
 
-60 tests, five suites (`tracker`, `detector`, `metrics`, `metrics aggregate`,
-`detector_ceiling`). The suite runner is hand-rolled (`tests/_runner.py`) because
-pytest is not available in this environment.
+The suite is dependency-light and covers tracker lifecycle and recovery,
+Kalman stability, Hungarian association, detector batch/OOM handling, metric
+regression cases, aggregate semantics, detector-ceiling matching, and
+visualisation-path parsing.
 
-The tests are written as **regression tests with hand-computed or captured
-expectations**, not smoke tests. Where a fix could be "verified", each test was
-mutation-checked: reintroducing the original bug must turn it red. Notable cases:
+## Project Structure
 
-- the MOT17-02 frame-119 Kalman covariance crash fixture
-- `min_hits` promotion and empty-frame track aging
-- detector OOM retry must not drop or duplicate frames
-- HOTA must fall when identities are scrambled even if every box is perfect
-- OVERALL MOTA/recall/precision must be pooled from summed event counts, not
-  averaged across sequences, and `num_matches` must be summed at all
+```text
+src/mot/       detector, data loader, Kalman filter, trackers, metrics, pipeline
+scripts/       benchmarks, evaluation, detector sweep, report, video renderer
+tests/         standalone regression suite
+WRITEUP.md     detailed technical notes and previously recorded experiment tables
+REPORT.md      concise AWS submission report
+```
 
-## Metrics
+## Limitations
 
-`src/mot/metrics.py` wraps `motmetrics` 1.4.0 for MOTA / MOTP / IDF1 and the event
-counts, with two deliberate deviations:
-
-- **The distance matrix is computed locally.** `motmetrics.distances.iou_matrix`
-  calls `np.asfarray`, removed in NumPy 2.0, and this project runs NumPy 2 with a
-  CUDA build of PyTorch. `distance_matrix()` reimplements it with the exact
-  semantics `MOTAccumulator.update` documents (`NaN` = forbidden pair), so the
-  accumulator still does the matching and scoring.
-- **MOTP is converted to a percentage.** `motmetrics` reports the *mean matching
-  distance* (lower is better); MOTChallenge and every leaderboard publish
-  `1 - distance`. Without the conversion the column would be mislabelled.
-- **Ignore regions are handled explicitly.** `motmetrics` has no notion of MOT17's
-  annotated distractor / ignored boxes, so detections inside them are filtered
-  before scoring. The regions are applied to *hypotheses only*: a ground-truth box
-  whose centre falls inside an ignore region still counts as a missed target. That
-  is the convention implemented here, and it is the only thing the phrase "ignore
-  regions" leaves open, so it is worth quantifying. Dropping such ground-truth
-  boxes as well was measured over the seven SORT sequences: HOTA moves by **+0.91 on
-  average**, ranging from −0.14 (MOT17-09) to +2.16 (MOT17-04), and MOTA by **−0.83
-  on average**, reaching −6.36 on MOT17-09. A +2.16 HOTA shift is ~10% of this
-  project's 21.5 baseline, so neither metric should be compared across the two
-  conventions without a note.
-
-HOTA is implemented from the paper in the same module so its definition is auditable
-in one place. Association is a sequence-wide Jaccard over global
-`(gt id, tracker id)` pairs, so dropping the association term is a silent bug that
-makes HOTA degenerate into a detection score and return 1.0 even when every frame
-has a different track id. `tests/test_metrics.py` pins this.
-
-This is the TrackEval *formulation*, but the per-sequence values here are **not**
-directly comparable to published MOTChallenge HOTA numbers. This project evaluates
-MOT17 classes 1/2/4/7 as targets; the official protocol scores class 1 only and
-suppresses hypotheses matched to distractor classes. Measured on identical
-hypothesis files, restricting ground truth to class 1 alone shifts per-sequence
-HOTA by +0.08 to +2.38 (mean +0.91 over the seven sequences). Compare against
-other work only after normalising the class convention. The per-frame Hungarian assignment is
-driven by the global alignment score rather than raw IoU, which is what stops
-identity flipping between nearby people.
-
-Two deliberate differences from the TrackEval tool are worth stating plainly. The
-MOTChallenge rates in the `OVERALL` row — MOTA, precision, recall, MOTP, IDF1 — are
-pooled the way TrackEval's `COMBINED_SEQ` pools them, but **HOTA is not**: TrackEval
-pools per-alpha TP counts and association sums across sequences and recomputes the
-score, whereas `OVERALL` takes the unweighted mean of the per-sequence HOTA values.
-Both are legitimate, but they are different quantities, so the HOTA `OVERALL` must not
-be quoted as TrackEval's `COMBINED_SEQ` HOTA. On this dataset the distinction is not
-cosmetic: pooled MOTA is 34.87 against a sequence mean of 32.07, because pooling
-weights MOT17-02's 26,960 evaluated objects against much longer sequences
-differently than averaging seven scores does.
-
-And TrackEval's per-frame assignment uses buffered
-`+=` indexing, which keeps only the last write for a duplicated index; this
-implementation uses `np.add.at`, which sums every row. The two agree exactly on
-valid MOT data, where an id appears at most once per frame, and differ only on
-input that is not valid MOT data.
-
-## Notes and limitations
-
-- **Appearance is not person-ReID.** The descriptor is a generic ImageNet
-  MobileNetV3-small embedding in HSV, L2-normalised. It separates pedestrians well enough
-  to be useful but is not trained to distinguish *individuals*; a trained ReID checkpoint
-  was not obtainable in this environment. This is the single biggest available
-  improvement.
-- Detection quality dominates the absolute numbers. See the detector sweep in the
-  write-up; recall is the binding constraint.
-- `bus.jpg` in the repository root is an Ultralytics demo asset, not project input.
+- The appearance descriptor is not a trained person-ReID model.
+- Detector recall is a principal bottleneck; association cannot recover boxes
+  that were never detected.
+- Dataset, detector weights, generated results, logs, and video remain ignored
+  and must be retained locally to reproduce the recorded benchmark.
+- Full benchmark runtime and VRAM usage depend on the GPU, driver, and model
+  build.
 
 ## License
 
-MIT — see [LICENSE](LICENSE), which also carries the TrackEval notice for the
-transcribed HOTA metric in `src/mot/metrics.py`.
-
-The HOTA metric in `src/mot/metrics.py` was transcribed from TrackEval
-(https://github.com/JonathonLuiten/TrackEval, © Jonathon Luiten). TrackEval is
-MIT-licensed and carries its own copyright notice; the attribution above was
-written from the upstream project without re-fetching its license text, since
-this environment has no outbound network access — verify against upstream before
-redistribution if that matters for your compliance process.
-
-MOT17 is distributed by its own authors under its own terms.
+MIT. See `LICENSE`; MOT17 has its own terms. The HOTA implementation is a
+documented transcription of the MIT-licensed TrackEval formulation.

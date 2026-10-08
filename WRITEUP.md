@@ -1,5 +1,10 @@
 # Recovering identity through occlusion on MOT17
 
+> **Detailed technical reference.** The final verified seven-sequence results
+> are summarized in `REPORT.md` and retained in the local `metrics.json`
+> artifacts. The detailed and external-comparison tables below are reference
+> material; use `REPORT.md` for final submission claims.
+
 **Question.** When a pedestrian is occluded for a few seconds and re-emerges, can a
 tracker recover the *same identity* — and what does that cost in false positives?
 
@@ -18,7 +23,7 @@ Dataset: the seven MOT17 **FRCNN** train sequences (02, 04, 05, 09, 10, 11, 13),
 suppressed. Metrics are 0–100 for MOTA/MOTP/HOTA and 0–1 for IDF1.
 
 **Result.** Holding the detector fixed, adding occlusion-aware association moves
-**HOTA 21.51 → 32.01 (+10.51)** and **IDF1 0.267 → 0.379**, with **−27% identity
+**HOTA 21.51 → 32.01 (+10.50)** and **IDF1 0.267 → 0.379**, with **−27% identity
 switches** (−813 over 5,316 frames). It costs **−3.69 precision** (88.48 → 84.79)
 and **−1.34 MOTP**, most plausibly because surviving tracks emit boxes for
 pedestrians that are not annotated. The trade is "remember more, be wrong more
@@ -164,11 +169,11 @@ cannot rescue a detector that misses half the pedestrians.
 
 ---
 
-## 3. Results
+## 3. Reference Benchmark Tables
 
 Detector fixed at `yolo11x` / `imgsz=1600` / `conf=0.25` for both trackers.
 
-### Per sequence (SORT / occlusion)
+### Per sequence (SORT / occlusion; detailed reference)
 
 | sequence | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec | Matches |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -344,7 +349,7 @@ tracker at `imgsz=1600` on one RTX 5060.
 - Metrics recomputed from `.txt` agree with `metrics.json` to within 0.002 HOTA and
   0.015 MOTA per sequence; the residual is `%.2f` quantisation, not a metric
   disagreement.
-## SOTA comparison (MOT17-FRCNN, full 7 sequences)
+## Historical external-tracker comparison (unverified in this checkout)
 
 | Tracker | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -354,7 +359,7 @@ tracker at `imgsz=1600` on one RTX 5060.
 | Occlusion-Aware (ours) | 39.66 | 81.09 | 32.01 | 0.379 | 2204 | 3315 | 17.1 | 23.1 | 49.11 | 84.79 |
 | SORT (ours baseline) | 34.87 | 82.43 | 21.51 | 0.267 | 3017 | 3635 | 6.1 | 38.9 | 40.97 | 88.48 |
 
-## Ablation study (MOT17-FRCNN, full 7 sequences)
+## Historical ablation study (MOT17-FRCNN, full 7 sequences)
 
 | Configuration | MOTA | MOTP | HOTA | IDF1 | IDS | Frag | MT | ML | Rec | Prec |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -362,4 +367,3 @@ tracker at `imgsz=1600` on one RTX 5060.
 | w/o appearance | 39.48 | 81.13 | 31.61 | 0.369 | 2376 | 3324 | 16.9 | 23.7 | 48.69 | 85.09 |
 | w/o REID recovery | 39.61 | 81.13 | 31.85 | 0.370 | 2210 | 3323 | 16.9 | 23.4 | 48.79 | 85.09 |
 | w/o cascade (Hungarian) | 39.81 | 81.05 | 31.26 | 0.388 | 1730 | 3059 | 21.3 | 23.3 | 49.76 | 84.03 |
-

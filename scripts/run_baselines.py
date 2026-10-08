@@ -1,11 +1,9 @@
-"""Run published SOTA trackers on identical cached detections.
+"""Run optional external trackers on identical cached detections.
 
-The write-up claims the occlusion tracker is competitive; that claim needs a
-comparison against published trackers, not only against this repo's own SORT
-baseline. This script runs the boxmot implementations of ByteTrack, OC-SORT
-and BoT-SORT with their *default* parameters on the same yolo11x detections
-this repo's trackers see (shared ``--dets-cache``), then scores every tracker
-with this repo's evaluator, so the comparison is apples-to-apples:
+This script runs the BoxMOT implementations of ByteTrack, OC-SORT and BoT-SORT
+with their default parameters on the same yolo11x detections this repository's
+trackers see (shared ``--dets-cache``), then scores every tracker with this
+repository's evaluator:
 
     PYTHONPATH=src ./venv/bin/python scripts/run_baselines.py \
         --sequences all --dets-cache results/dets_cache --out results/sota
@@ -40,9 +38,21 @@ from mot.metrics import aggregate, evaluate, format_table
 BOXMOT_TRACKERS = ("bytetrack", "ocsort", "botsort")
 
 
+def load_boxmot():
+    """Import the optional baseline package with an actionable error."""
+    try:
+        from boxmot import BotSort, ByteTrack, OcSort
+    except ImportError as exc:
+        raise SystemExit(
+            "BoxMOT is optional and is not installed. Run `pip install boxmot` "
+            "before using scripts/run_baselines.py."
+        ) from exc
+    return BotSort, ByteTrack, OcSort
+
+
 def make_boxmot(name, seq):
     """Build a boxmot tracker with vendor defaults at the sequence's frame rate."""
-    from boxmot import BotSort, ByteTrack, OcSort
+    BotSort, ByteTrack, OcSort = load_boxmot()
     if name == "bytetrack":
         return ByteTrack(frame_rate=seq.fps)
     if name == "ocsort":
@@ -138,6 +148,13 @@ def main(argv=None):
     ap.add_argument("--max-frames", type=int, default=None)
     args = ap.parse_args(argv)
 
+    trackers = [t.strip() for t in args.trackers.split(",") if t.strip()]
+    for t in trackers:
+        if t not in BOXMOT_TRACKERS:
+            print(f"unknown tracker {t}; have {BOXMOT_TRACKERS}", file=sys.stderr)
+            return 2
+    load_boxmot()
+
     root = find_dataset_root(args.dataset_root)
     seqs = list_sequences(root, detector="FRCNN")
     if args.sequences != "all":
@@ -150,12 +167,6 @@ def main(argv=None):
     if not seqs:
         print("no sequences matched", file=sys.stderr)
         return 2
-
-    trackers = [t.strip() for t in args.trackers.split(",") if t.strip()]
-    for t in trackers:
-        if t not in BOXMOT_TRACKERS:
-            print(f"unknown tracker {t}; have {BOXMOT_TRACKERS}", file=sys.stderr)
-            return 2
 
     print(f"dataset {root}; caching detections to {args.dets_cache}", flush=True)
     ensure_cache(root, seqs, args.dets_cache,
@@ -207,7 +218,7 @@ def main(argv=None):
         fh.write("\n")
     print(f"\nwrote {path}")
 
-    print("\n=== SOTA comparison (OVERALL) ===")
+    print("\n=== External tracker comparison (OVERALL) ===")
     print(f"{'tracker':16s} {'MOTA':>7s} {'MOTP':>7s} {'HOTA':>7s} {'IDF1':>6s} {'IDS':>6s}")
     for name, d in summary.items():
         a = d["aggregate"]

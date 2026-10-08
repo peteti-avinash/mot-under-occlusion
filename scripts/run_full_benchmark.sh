@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full MOT17-FRCNN benchmark: SORT baseline then the occlusion-aware tracker.
 # Run sequentially so both jobs do not contend for the GPU.
-set -u
+set -uo pipefail
 
 cd "$(dirname "$0")/.."
 export PYTHONPATH=src
@@ -17,10 +17,12 @@ run() {
         --tracker "${tracker}" \
         --out-dir "results/full_${tracker}" \
         2>&1 | tee "logs/full_${tracker}.log"
-    echo "=== ${tracker} exit=${PIPESTATUS[0]} $(date -Is) ==="
+    local status=${PIPESTATUS[0]}
+    echo "=== ${tracker} exit=${status} $(date -Is) ==="
+    return "${status}"
 }
 
-run sort
-run occlusion
+run sort || exit $?
+run occlusion || exit $?
 
 echo "ALL BENCHMARKS COMPLETE $(date -Is)"
